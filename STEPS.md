@@ -141,7 +141,7 @@ ldd .venv/lib/python3.14/site-packages/sumo/bin/sumo | grep "not found"
 
 Vì SUMO nằm trong `.venv`, **không cần đặt `SUMO_HOME` thủ công** — nhưng vài script trong `sumo-tools` vẫn đọc biến này. Thêm vào `.env`:
 ```bash
-SUMO_HOME=$(python -c "import sumolib, pathlib; print(pathlib.Path(sumolib.__file__).parents[1])")
+SUMO_HOME=$(python -c "import sumo, pathlib; print(pathlib.Path(sumo.__file__).parent)")
 ```
 
 Tạo `src/sumo_agents/sim/conn.py` — lớp bọc mỏng để đổi `traci` ↔ `libsumo` bằng cờ config (libsumo nhanh hơn 3–10× nhưng không có GUI).
