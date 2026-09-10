@@ -1,3 +1,4 @@
+aiosqlite==0.22.1
 alembic==1.19.2
 annotated-doc==0.0.5
 annotated-types==0.8.0
@@ -11,6 +12,7 @@ httpcore2==2.12.0
 httptools==0.8.0
 httpx2==2.12.0
 idna==3.19
+iniconfig==2.3.0
 jiter==0.16.0
 libsumo==1.27.1
 Mako==1.4.1
@@ -18,11 +20,15 @@ markdown-it-py==4.2.0
 MarkupSafe==3.0.3
 mdurl==0.1.2
 openai==3.10.0
+packaging==26.3
+pluggy==1.6.0
 psycopg==3.3.5
 psycopg-binary==3.3.5
 pydantic==2.13.5
 pydantic_core==2.46.5
 Pygments==2.21.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
 python-dotenv==1.2.3
 PyYAML==6.0.3
 rich==15.0.0

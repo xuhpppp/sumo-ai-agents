@@ -3,7 +3,7 @@
 > Đi kèm [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) · v0.2 · 2026-09-09
 > Môi trường đã xác nhận: Ubuntu 24.04 (WSL2) · `/usr/bin/python3.14` có sẵn · Docker có sẵn · mạng OK
 
-**Cách dùng**: mỗi bước có **DoD** (Definition of Done) — điều kiện nghiệm thu. Không sang bước sau khi DoD chưa đạt. Mỗi bước là một commit.
+**Cách dùng**: mỗi bước có **DoD** (Definition of Done) — điều kiện nghiệm thu. Không sang bước sau khi DoD chưa đạt. Mỗi bước là một commit. Trạng thái: ⬜ chưa làm · 🔄 đang làm · ✅ đã đạt DoD.
 
 **Nguyên tắc xuyên suốt**: những bước có dấu 🔒 là *điều kiện tiên quyết về an toàn/đo lường* — chúng phải xong trước khi gọi LLM lần đầu tiên. Đây là lý do Bước 1–9 không có dòng code AI nào.
 
@@ -13,10 +13,10 @@
 
 | # | Bước | Phase | Ước lượng | Trạng thái |
 |---|---|---|---|---|
-| 1 | Khởi tạo repo + `.venv` + Python 3.14 | 0 | 45' | ⬜ |
-| 2 | Cài SUMO qua pip, chạy thử | 0 | 30' | ⬜ |
-| 3 | Sinh mạng lưới `grid_4x4` | 0 | 1h | ⬜ |
-| 4 | Postgres + SQLAlchemy + Alembic | 0 | 2h | ⬜ |
+| 1 | Khởi tạo repo + `.venv` + Python 3.14 | 0 | 45' | ✅ |
+| 2 | Cài SUMO qua pip, chạy thử | 0 | 30' | ✅ |
+| 3 | Sinh mạng lưới `grid_4x4` | 0 | 1h | ✅ |
+| 4 | Postgres + SQLAlchemy + Alembic | 0 | 2h | ✅ |
 | 5 | `SimRunner` vòng lặp trần + thu metric | 0 | 3h | ⬜ |
 | 6 | Biểu đồ waiting time từ DB | 0 | 1h | ⬜ |
 | 7 | 🔒 `validator.py` + unit test | 1 | 3h | ⬜ |
