@@ -112,6 +112,12 @@ class Run(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     git_sha: Mapped[str | None] = mapped_column(String)
     config: Mapped[dict] = mapped_column(JSONType, nullable=False)
+    # Whole-run aggregates that don't fit the per-(sim_time, junction) shape
+    # of `metrics` -- e.g. mean_travel_time_s / n_completed_trips (STEPS.md
+    # Step 9), computed once from vehicle depart/arrival events and written
+    # by Store.finish_run(). A JSON bag (like `config`) instead of dedicated
+    # columns so later steps can add fields here without another migration.
+    summary: Mapped[dict | None] = mapped_column(JSONType)
 
 
 class Message(Base):

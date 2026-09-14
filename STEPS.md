@@ -22,7 +22,7 @@
 | 6 | Biểu đồ waiting time từ DB | 0 | 1h | ✅ |
 | 7 | 🔒 `validator.py` + unit test | 1 | 3h | ✅ |
 | 8 | 3 baseline: fixed / actuated / maxpressure | 1 | 4h | ✅ |
-| 9 | 🔒 Bảng so sánh baseline (harness chạy nhiều run) | 1 | 2h | ⬜ |
+| 9 | 🔒 Bảng so sánh baseline (harness chạy nhiều run) | 1 | 2h | ✅ |
 | 10 | `agents/llm.py` — call site duy nhất | 2 | 2h | ⬜ |
 | 11 | `protocol.py` — schema Pydantic | 2 | 2h | ⬜ |
 | 12 | `JunctionAgent` (vòng 1: observe) | 2 | 4h | ⬜ |
@@ -321,13 +321,34 @@ Cả 3 chạy hết 3600s (thực tế ~3800-3820s do xe chạy nốt, như Bư�
 
 ---
 
-## Bước 9 · 🔒 Bảng so sánh baseline
+## Bước 9 · 🔒 Bảng so sánh baseline ✅
 
 **Mục tiêu**: harness chạy nhiều run và ra bảng — hạ tầng đo lường hoàn chỉnh.
 
-`scripts/compare.py`: chạy N chế độ × M seed, ghi vào `runs`, xuất bảng markdown (mean waiting, travel time, throughput, queue p95, CO₂) kèm khoảng tin cậy.
+**Đã làm**:
 
-**DoD**: một lệnh sinh ra bảng so sánh 3 chế độ × 3 seed. Bảng này chính là **bảng kết quả cuối cùng của POC** — chỉ thêm cột `llm` ở Bước 14.
+- Schema: thêm cột `runs.summary` (JSONB, nullable — migration `4f233553e441`) chứa các số liệu **toàn run** không hợp với hình dạng bảng `metrics` (mỗi dòng là 1 junction tại 1 mốc thời gian): `mean_travel_time_s`, `n_completed_trips`. Chọn 1 cột JSON linh hoạt thay vì thêm cột cứng cho từng số liệu, giống cách `config`/`params`/`effect` đã làm — Bước 14/17 có thể thêm field vào đây mà không cần migrate lại.
+- `sim/runner.py`: theo dõi `simulation.getDepartedIDList()`/`getArrivedIDList()` mỗi step (không thể chỉ đọc tại mốc lấy mẫu 10s vì sẽ bỏ sót xe đến/đi giữa 2 mốc), tính `travel_time = t_đến - t_khởi hành` mỗi xe hoàn thành, ghi trung bình + số xe hoàn thành vào `runs.summary` lúc `finish_run()`. `run()` giờ trả về `run_id` (trước đây chỉ `print`) để `compare.py` gọi thẳng trong tiến trình, không phải parse stdout.
+- `scripts/compare.py`: chạy N chế độ × M seed **tuần tự trong cùng 1 tiến trình** (gọi thẳng `sim.runner.run()`, không subprocess — bắt buộc tuần tự vì `libsumo` chỉ cho 1 simulation/tiến trình). Với mỗi run: `mean_waiting_s`/`queue_p95`/`mean_co2_mg` tính từ bảng `metrics` (trung bình và `percentile_cont(0.95)` qua SQL trên Postgres), `mean_travel_time_s`/`n_completed_trips` (đổi tên hiển thị là "throughput") đọc từ `runs.summary`. Gộp qua các seed: mean ± khoảng tin cậy ~95% (xấp xỉ chuẩn `1.96·stdev/√n`, **không phải** khoảng Student-t chính xác — với mặc định 3 seed đây chỉ là ước lượng thô, đã ghi rõ trong bảng xuất ra). Xuất bảng markdown (`data/compare/<scenario>.md`) **và** biểu đồ cột 5 panel kèm error bar (`data/plots/compare_<scenario>.png`, theo yêu cầu bổ sung của người dùng).
+
+**Verify**:
+
+```bash
+python scripts/compare.py --scenario grid_4x4   # mặc định: fixed,actuated,maxpressure × seed 42,43,44
+# -> chạy 9 lần (~22s tổng, libsumo headless), in bảng, ghi data/compare/grid_4x4.md + data/plots/compare_grid_4x4.png
+```
+
+Kết quả (grid_4x4, 3 seed):
+
+| mode | Mean waiting (s) | Mean travel time (s) | Throughput | Queue p95 | CO2 (mg/s) |
+|---|---|---|---|---|---|
+| fixed | 6.6 ± 0.2 | 136.9 ± 2.5 | 4500.0 ± 0.0 | 13.3 ± 0.7 | 24022.8 ± 438.6 |
+| actuated | 2.7 ± 0.1 | 105.2 ± 2.1 | 4500.0 ± 0.0 | 5.0 ± 0.0 | 19307.8 ± 219.0 |
+| maxpressure | 6.5 ± 0.3 | 138.3 ± 2.6 | 4500.0 ± 0.0 | 13.3 ± 0.7 | 24349.3 ± 400.8 |
+
+**Phát hiện cần ghi nhận trung thực**: `actuated` vẫn vượt trội rõ rệt cả 3 seed (đúng như kỳ vọng — "đối thủ thật sự"). Nhưng `maxpressure` — vốn đã thắng `fixed` ở Bước 8 khi đo riêng seed=42 (6.22s so với 6.49s) — khi gộp cả 3 seed thì **gần như hòa** với `fixed` (6.5±0.3 so với 6.6±0.2, khoảng tin cậy chồng lấn nhau; travel time thậm chí nhỉnh hơn một chút: 138.3 so với 136.9). Nghĩa là bộ tham số của `maxpressure` (chỉnh ở Bước 8) đã **bám khá sát vào đúng động lực học sự cố của seed=42**, chưa chắc tổng quát hoá tốt sang seed khác — một giới hạn thật của cách tiếp cận đơn giản (nhích từng bước nhỏ theo áp lực đo được), không phải lỗi code. Không tinh chỉnh lại thêm ở bước này (tránh overfit tiếp vào đúng 3 seed dùng để đo) — ghi nhận đúng tinh thần "báo cáo trung thực cả chỗ thua" của plan §7, để lại như một hạn mục biết trước nếu sau này muốn cải thiện `maxpressure`.
+
+**DoD**: một lệnh sinh ra bảng so sánh 3 chế độ × 3 seed — **đã đạt** (DoD không yêu cầu `maxpressure` phải thắng ở bước này, chỉ yêu cầu hạ tầng đo lường hoạt động).
 
 > 🚩 Hoàn thành Bước 9 nghĩa là bạn đã có một POC hoàn chỉnh *không cần AI*. Mọi thứ sau đây là thêm lớp AI vào một nền đã đo được.
 

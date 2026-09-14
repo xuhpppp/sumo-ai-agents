@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import statistics
+import uuid
 from pathlib import Path
 
 from sumo_agents.baselines.actuated import ActuatedController
@@ -65,7 +67,11 @@ def make_controller(mode: str, conn: SumoConnection) -> Controller:
     raise ValueError(f"unknown mode {mode!r} (Phase 2 will add 'llm')")
 
 
-async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> None:
+async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid.UUID:
+    """Run one (scenario, mode, seed) simulation end to end and return its
+    run_id -- scripts/compare.py (STEPS.md Step 9) calls this directly,
+    in-process, once per (mode, seed) combination (sequentially: libsumo
+    only supports one simulation per process at a time)."""
     scenario_dir = NETWORKS_DIR / scenario
     sumo_cfg = scenario_dir / _SUMOCFG_BY_MODE.get(mode, _DEFAULT_SUMOCFG)
     incidents_path = scenario_dir / "incidents.yaml"
@@ -91,6 +97,13 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> None
         print(f"run_id={run_id} scenario={scenario} mode={mode} seed={seed}")
 
         conn = SumoConnection(backend=Backend.TRACI if gui else Backend.LIBSUMO, gui=gui)
+        # Whole-run summary (STEPS.md Step 9 -- mean travel time / throughput
+        # aren't per-junction, so they don't fit the `metrics` table; tracked
+        # here via TraCI's own depart/arrive events and written once at the
+        # end, see Store.finish_run). Declared before `try` so a run that
+        # errors out mid-loop still finishes with whatever was observed so far.
+        depart_time_by_vehicle: dict[str, float] = {}
+        travel_times_s: list[float] = []
         try:
             conn.start(sumo_cfg, seed=seed)
             junction_ids = traffic_light_ids(conn)
@@ -115,6 +128,13 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> None
                 injector.apply(conn, sim_time)
                 conn.simulation_step()
                 sim_time = conn.simulation.getTime()
+
+                for vehicle_id in conn.simulation.getDepartedIDList():
+                    depart_time_by_vehicle[vehicle_id] = sim_time
+                for vehicle_id in conn.simulation.getArrivedIDList():
+                    depart_time = depart_time_by_vehicle.pop(vehicle_id, None)
+                    if depart_time is not None:
+                        travel_times_s.append(sim_time - depart_time)
 
                 if sim_time - last_sample_time >= METRIC_SAMPLE_INTERVAL_S:
                     snapshots = collect_state(conn, junction_ids)
@@ -162,10 +182,15 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> None
             final_sim_time = conn.simulation.getTime()
         finally:
             conn.close()
-            await store.finish_run(run_id)
+            summary = {
+                "n_completed_trips": len(travel_times_s),
+                "mean_travel_time_s": statistics.fmean(travel_times_s) if travel_times_s else None,
+            }
+            await store.finish_run(run_id, summary=summary)
 
     await engine.dispose()
     print(f"done: final_sim_time={final_sim_time}s")
+    return run_id
 
 
 def main() -> None:

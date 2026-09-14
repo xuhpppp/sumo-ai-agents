@@ -54,11 +54,12 @@ class Store:
             await session.refresh(run)
             return run.run_id
 
-    async def finish_run(self, run_id: uuid.UUID) -> None:
+    async def finish_run(self, run_id: uuid.UUID, *, summary: dict[str, Any] | None = None) -> None:
+        values: dict[str, Any] = {"finished_at": datetime.now(UTC)}
+        if summary is not None:
+            values["summary"] = summary
         async with self._session_factory() as session:
-            await session.execute(
-                update(Run).where(Run.run_id == run_id).values(finished_at=datetime.now(UTC))
-            )
+            await session.execute(update(Run).where(Run.run_id == run_id).values(**values))
             await session.commit()
 
     # ------------------------------------------------------------------ #
