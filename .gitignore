@@ -149,6 +149,9 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
+# Run outputs (plots, etc. -- generated from Postgres data, not source)
+data/
+
 # Environments
 .env
 .envrc

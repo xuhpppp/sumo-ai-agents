@@ -17,8 +17,9 @@
 | 2 | Cài SUMO qua pip, chạy thử | 0 | 30' | ✅ |
 | 3 | Sinh mạng lưới `grid_4x4` | 0 | 1h | ✅ |
 | 4 | Postgres + SQLAlchemy + Alembic | 0 | 2h | ✅ |
-| 5 | `SimRunner` vòng lặp trần + thu metric | 0 | 3h | ⬜ |
-| 6 | Biểu đồ waiting time từ DB | 0 | 1h | ⬜ |
+| 5 | `SimRunner` vòng lặp trần + thu metric | 0 | 3h | ✅ |
+| 5b | Xem lại trực quan bằng `sumo-gui` | 0 | 30' | ✅ |
+| 6 | Biểu đồ waiting time từ DB | 0 | 1h | ✅ |
 | 7 | 🔒 `validator.py` + unit test | 1 | 3h | ⬜ |
 | 8 | 3 baseline: fixed / actuated / maxpressure | 1 | 4h | ⬜ |
 | 9 | 🔒 Bảng so sánh baseline (harness chạy nhiều run) | 1 | 2h | ⬜ |
@@ -194,12 +195,34 @@ docker compose -f docker/docker-compose.yml up -d db
 
 **Mục tiêu**: chạy được 1 giờ mô phỏng và ghi metric — **chưa có AI**.
 
-- `sim/runner.py`: vòng lặp async theo §3.2 plan, nhưng `orchestrator=None` (chưa có agent)
-- `sim/state.py`: `collect_state()` → queue length, waiting time, phase hiện tại, flow từ nút hàng xóm. Phải **rẻ và tất định**
+- `sim/runner.py`: vòng lặp async theo §3.2 plan (`await asyncio.sleep(0)` mỗi step), `orchestrator=None` (chưa có agent). Điều kiện dừng dùng `simulation.getMinExpectedNumber() > 0` (chuẩn TraCI) thay vì đếm step cứng — nhu cầu xe kết thúc ở t=3600 (`trips.xml`) nhưng xe đã xuất phát còn chạy tiếp tới lúc đến nơi, nên run thực tế dài hơn 3600s một chút (~3800s trên máy này)
+- `sim/state.py`: `collect_state()` → với mỗi junction có đèn tín hiệu, đọc các lane đang được điều khiển (`trafficlight.getControlledLanes`) và tính `queue_len` (tổng xe đang dừng), `mean_waiting_s` (tổng waiting time / số xe), `throughput` (số xe hiện diện ở lane vào — proxy rẻ, không phải đếm lũy kế), `mean_speed`, `co2_mg`, `current_phase`. Toàn bộ chỉ đọc số liệu step-cuối-cùng mà SUMO đã tự tính sẵn → **rẻ và tất định**. Trả về `dict[junction_id, JunctionSnapshot]` — Bước 12 (Phase 2) dùng thẳng dict này, tra hàng xóm bằng cách lấy theo `junction_id` khác trong cùng dict (tô-pô tính từ `sumolib` ở Bước 12, không tính lại ở đây)
 - Lấy mẫu metric mỗi 10s mô phỏng → bảng `metrics`
-- `sim/incidents.py`: bơm sự cố theo **lịch có seed** từ YAML, không random runtime
+- `sim/incidents.py` + `networks/grid_4x4/incidents.yaml`: bơm sự cố theo **lịch có seed** từ YAML (không random runtime) — mỗi incident giảm tốc độ tối đa của mọi lane trên 1 edge còn `speed_factor` × bình thường, trong khoảng `[begin, begin+duration)`, rồi tự khôi phục. Đã kiểm chứng trực tiếp: `maxSpeed` giảm đúng lúc `begin`, giữ nguyên suốt cửa sổ, khôi phục đúng lúc kết thúc
 
-**DoD**: `python -m sumo_agents.sim.runner --scenario grid_4x4 --mode fixed` chạy hết 3600s, bảng `metrics` có ~5.760 dòng · chạy 2 lần cùng seed → số liệu trùng khớp
+**DoD**: `python -m sumo_agents.sim.runner --scenario grid_4x4 --mode fixed --seed 42` chạy hết 3600s (thực tế ~3816s do xe chạy nốt), bảng `metrics` có dữ liệu (đã đo: 4.584 dòng = 12 junction × ~382 mẫu) · chạy 2 lần cùng seed → **0 khác biệt** trên toàn bộ (sim_time, junction_id) → **đã verify, khớp**
+
+---
+
+## Bước 5b · Xem lại trực quan bằng `sumo-gui`
+
+**Mục tiêu**: có thêm một cách xem kết quả ngoài truy vấn DB (Bước 6) — nhìn trực tiếp xe chạy trên bản đồ.
+
+Vì mọi run đều tất định (seed cố định → kết quả giống hệt, đã verify ở Bước 3 và Bước 5), việc "xem lại" không cần ghi/replay dữ liệu gì cả — chỉ cần chạy lại **đúng scenario + đúng seed** trên backend `traci` với GUI bật:
+
+```bash
+python scripts/replay_gui.py --scenario grid_4x4 --seed 42
+python scripts/replay_gui.py --scenario grid_4x4 --seed 42 --delay 50   # chậm hơn/nhanh hơn
+```
+
+Script này độc lập với DB/`Store` — không tạo `run_id`, không ghi Postgres, chỉ dựng lại đúng những gì `SimRunner` đã thấy để xem bằng mắt, kể cả sự cố đã bơm ở Bước 5 (đọc cùng `incidents.yaml` nếu có). `--delay` là cờ có sẵn của `sumo-gui` (ms thời gian thực mỗi step mô phỏng) — cần thiết vì chạy `traci` nhanh như `libsumo` sẽ render nhanh hơn mắt theo kịp.
+
+Ngoài ra `sim/runner.py` cũng có cờ `--gui` để xem trực tiếp trong lúc chạy run "thật" (vẫn ghi DB bình thường, chỉ đổi sang backend `traci` để có cửa sổ):
+```bash
+python -m sumo_agents.sim.runner --scenario grid_4x4 --mode fixed --seed 42 --gui
+```
+
+**DoD**: `python scripts/replay_gui.py --scenario grid_4x4 --seed 42` mở được cửa sổ `sumo-gui`, xe di chuyển đúng theo scenario, tự kết thúc khi hết xe hoặc đóng thủ công. *(Cần chạy tương tác để xác nhận bằng mắt — không kiểm chứng tự động được, khác với Bước 5 vốn chỉ cần dữ liệu số.)*
 
 ---
 
@@ -207,11 +230,22 @@ docker compose -f docker/docker-compose.yml up -d db
 
 **Mục tiêu**: nhìn thấy được dữ liệu, kiểm chứng sự cố có thật sự gây tắc.
 
-Script `scripts/plot_run.py` — query `metrics`, vẽ mean waiting time theo thời gian, đánh dấu thời điểm sự cố.
+`scripts/plot_run.py` — query `metrics`, gộp trung bình **toàn mạng** (mean qua cả 12 junction) mỗi mẫu 10s, làm mượt bằng rolling mean cửa sổ 180s (≥ 2 chu kỳ đèn — chu kỳ đèn tín hiệu cố định của `grid_4x4` là 90s, xem `<tlLogic>` trong `net.xml`; nếu không làm mượt, sawtooth do pha đèn xanh/đỏ sẽ át hoàn toàn hiệu ứng của sự cố), rồi tô vùng thời gian sự cố (đọc từ `incidents.yaml`, không hardcode) lên biểu đồ.
 
-**DoD**: có file PNG cho thấy waiting time **tăng rõ rệt** đúng lúc sự cố xảy ra. Nếu không thấy khác biệt → nhu cầu giao thông quá thấp, chỉnh `-p` ở Bước 3 rồi làm lại.
+```bash
+python scripts/plot_run.py --scenario grid_4x4
+```
 
-> 🚩 Đây là checkpoint quan trọng: nếu sự cố không tạo được tắc đường, thì không có gì cho agent giải quyết và toàn bộ POC vô nghĩa. Đừng đi tiếp khi chưa đạt.
+**⚠️ Phát hiện quan trọng khi verify checkpoint này**: cấu hình sự cố ban đầu ở Bước 5 (`speed_factor: 0.1`, tức còn ~1.39 m/s trên edge 13.89 m/s) **không** tạo ra tắc nghẽn nhìn thấy được — lý do là ngưỡng "halting" của SUMO (dùng bởi cả `getLastStepHaltingNumber` lẫn việc tính waiting time tích luỹ) là một hằng số tuyệt đối **0.1 m/s**, không phụ thuộc tốc độ tối đa của lane. Xe chạy ở 1.39 m/s vẫn được tính là "đang di chuyển", không phải "đang chờ" → sự cố chỉ làm chậm nhẹ, không tạo hàng chờ. Đã sửa `networks/grid_4x4/incidents.yaml` xuống `speed_factor: 0.005` (~0.07 m/s, dưới ngưỡng 0.1) — verify lại bằng cách chạy 2 lần cùng seed (vẫn 0 khác biệt, xác nhận sự thay đổi không phá tính tất định của Bước 5).
+
+**Kết quả sau khi sửa** (`data/plots/grid_4x4_<run_id>.png`, không commit — xem `.gitignore`):
+- Waiting time trung bình toàn mạng: nền ~4-5s → đỉnh ~21-33s trong lúc sự cố (1200-1800s), quay lại nền ngay sau khi hết sự cố
+- `queue_len` ở 2 junction cạnh sự cố (B1, B2) tăng từ nền ~4-5 lên đỉnh ~35-48
+- Có teleport do kẹt xe quá lâu (log cảnh báo `waited too long (jam)`) lan sang vài junction lân cận (B0B1, A1B1, B3B2, C1B1, A2B2) trong khoảng 1534-1801s — tức tắc nghẽn thực sự lan toả, không chỉ khoanh vùng ở 1 edge
+
+**DoD**: có file PNG cho thấy waiting time **tăng rõ rệt** đúng lúc sự cố xảy ra — **đã đạt**, xem mô tả trên.
+
+> 🚩 Đây là checkpoint quan trọng: nếu sự cố không tạo được tắc đường, thì không có gì cho agent giải quyết và toàn bộ POC vô nghĩa. Đừng đi tiếp khi chưa đạt. *(Ghi chú cho lần sau nếu đổi mạng lưới/scenario: nguyên nhân không phải lúc nào cũng là "nhu cầu quá thấp" như dự đoán ban đầu — ở đây là do ngưỡng halting tuyệt đối của SUMO, một chi tiết dễ bỏ sót khi thiết kế `speed_factor` theo tỷ lệ tương đối.)*
 
 ---
 
