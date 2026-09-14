@@ -20,7 +20,7 @@
 | 5 | `SimRunner` vòng lặp trần + thu metric | 0 | 3h | ✅ |
 | 5b | Xem lại trực quan bằng `sumo-gui` | 0 | 30' | ✅ |
 | 6 | Biểu đồ waiting time từ DB | 0 | 1h | ✅ |
-| 7 | 🔒 `validator.py` + unit test | 1 | 3h | ⬜ |
+| 7 | 🔒 `validator.py` + unit test | 1 | 3h | ✅ |
 | 8 | 3 baseline: fixed / actuated / maxpressure | 1 | 4h | ⬜ |
 | 9 | 🔒 Bảng so sánh baseline (harness chạy nhiều run) | 1 | 2h | ⬜ |
 | 10 | `agents/llm.py` — call site duy nhất | 2 | 2h | ⬜ |
@@ -251,15 +251,37 @@ python scripts/plot_run.py --scenario grid_4x4
 
 # PHASE 1 — Baseline + An toàn
 
-## Bước 7 · 🔒 `validator.py` + unit test
+## Bước 7 · 🔒 `validator.py` + unit test ✅
 
 **Mục tiêu**: lớp an toàn tất định, xong **trước** khi có LLM.
 
-- `safety/validator.py`: `HARD_CONSTRAINTS` + hàm `validate(action, tls_state) -> ValidationResult(ok, violations, clamped_action)`
-- Chính sách: **clamp nếu vượt biên, reject nếu sai cấu trúc**
-- `tests/test_validator.py` — bao phủ: min/max green, cấm sửa yellow/all-red, giới hạn cycle, `max_delta_per_cycle`, chống bỏ đói hướng, và **`no_action` luôn hợp lệ**
+**Đã làm**:
 
-**DoD**: ≥15 test case pass · coverage `validator.py` ≥ 90% · không import gì liên quan LLM
+- `src/sumo_agents/safety/validator.py`:
+  - `HARD_CONSTRAINTS` đúng theo plan §5 (`min_green_s=7`, `max_green_s=90`, `yellow_s=3` cố định, `all_red_s=2` cố định, `min_cycle_s=40`, `max_cycle_s=150`, `max_delta_per_cycle_s=15`, `max_starvation_s=120`).
+  - Không gian hành động (Pydantic model, discriminated bởi `type`) đúng bảng ở plan §5: `AdjustPhaseSplit`, `SetCycleLength`, `SetOffset`, `RequestVms`, `NoAction`. Đây là bản tối thiểu cho riêng validator — schema Pydantic "chính thức" dùng chung cho LLM sẽ làm ở Bước 11 (`protocol.py`), có thể tái dùng hoặc định nghĩa lại các model này, không phá vỡ gì ở đây vì validator không phụ thuộc ngược vào `protocol.py`.
+  - `TlsState`/`PhaseState` (dataclass, giống style `sim/state.py`): trạng thái TLS tối thiểu validator cần — danh sách phase kèm loại (`green`/`yellow`/`all_red`) và `time_since_last_green_s` cho việc chống bỏ đói hướng.
+  - `validate(action, tls_state) -> ValidationResult(ok, violations, clamped_action)`.
+  - Chính sách **clamp nếu vượt biên, reject nếu sai cấu trúc/ngữ nghĩa**:
+    - `adjust_phase_split`: reject nếu `phase_id` không tồn tại hoặc không phải phase `green` (cấm sửa yellow/all-red); reject nếu `delta_s < 0` mà phase đó đã bị bỏ đói ≥ `max_starvation_s` (không cho phép giảm thêm); còn lại thì clamp `delta_s` theo `max_delta_per_cycle_s`, rồi clamp kết quả `duration` theo `[min_green_s, max_green_s]`.
+    - `set_cycle_length`: clamp theo `[min_cycle_s, max_cycle_s]`.
+    - `set_offset`: clamp theo `[0, max_cycle_s]`.
+    - `request_vms`: reject nếu `alt_route` rỗng hoặc có cạnh lặp lại (vòng lặp); clamp `duration_s` theo `[0, max_cycle_s * 24]` (không cho VMS kéo dài hơn cả 1 giờ mô phỏng).
+    - `no_action`: luôn hợp lệ, không có ràng buộc nào để kiểm tra.
+- `tests/test_validator.py` — 27 test case, bao phủ đúng danh sách yêu cầu (min/max green, cấm sửa yellow/all-red, giới hạn cycle, `max_delta_per_cycle`, chống bỏ đói hướng cả 2 chiều — reject khi giảm phase đã đói, cho phép tăng phase đã đói — và `no_action` luôn hợp lệ) cộng thêm `set_offset`, `request_vms`, và một test tĩnh (`ast` parse source) xác nhận module không import gì có tên chứa `openai`/`anthropic`/`llm`.
+
+**Verify**:
+
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_validator.py -v --cov=sumo_agents.safety.validator --cov-report=term-missing
+# 27 passed · coverage 100% (109/109 statements)
+python -m pytest   # toàn bộ 33 test (models + validator) pass
+```
+
+Đã thêm `pytest-cov` (MIT license) vào môi trường + `requirements.txt` (`pip freeze`) để đo coverage cho DoD này.
+
+**DoD**: ≥15 test case pass (27/27) · coverage `validator.py` ≥ 90% (đạt 100%) · không import gì liên quan LLM (xác nhận qua `test_module_has_no_llm_imports`) — **đã đạt**.
 
 ---
 
