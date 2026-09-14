@@ -21,7 +21,7 @@
 | 5b | Xem lại trực quan bằng `sumo-gui` | 0 | 30' | ✅ |
 | 6 | Biểu đồ waiting time từ DB | 0 | 1h | ✅ |
 | 7 | 🔒 `validator.py` + unit test | 1 | 3h | ✅ |
-| 8 | 3 baseline: fixed / actuated / maxpressure | 1 | 4h | ⬜ |
+| 8 | 3 baseline: fixed / actuated / maxpressure | 1 | 4h | ✅ |
 | 9 | 🔒 Bảng so sánh baseline (harness chạy nhiều run) | 1 | 2h | ⬜ |
 | 10 | `agents/llm.py` — call site duy nhất | 2 | 2h | ⬜ |
 | 11 | `protocol.py` — schema Pydantic | 2 | 2h | ⬜ |
@@ -285,17 +285,39 @@ python -m pytest   # toàn bộ 33 test (models + validator) pass
 
 ---
 
-## Bước 8 · 3 baseline
+## Bước 8 · 3 baseline ✅
 
 **Mục tiêu**: có đối thủ để so sánh.
 
-- `baselines/fixed.py` — chu kỳ cố định (điểm sàn)
-- `baselines/actuated.py` — dùng `<tlLogic type="actuated">` sẵn có của SUMO (**đối thủ thật sự**)
-- `baselines/maxpressure.py` — Max-Pressure, ~80 dòng, SOTA không học máy
+**Đã làm**:
 
-Cả ba cắm vào cùng interface `Controller.decide(snapshot) -> list[Action]` mà `llm` sẽ dùng ở Phase 2.
+- `src/sumo_agents/baselines/base.py`: `Controller` Protocol — `decide(snapshot: dict[str, JunctionSnapshot], sim_time: float) -> list[Action]`, cùng loại `Action` với `safety/validator.py` (Bước 7) — đây chính xác là interface `llm` sẽ dùng ở Phase 2, không phải một interface "tương tự".
+- `src/sumo_agents/sim/actuators.py` (module mới, đúng như cấu trúc repo ở plan §8 `sim/{runner,state,actuators,incidents}.py`): `phase_kind(state)` phân loại phase (`green`/`yellow`/`all_red`, cùng quy tắc đã dùng ở Bước 6), `read_tls_state()` dựng `TlsState` thật từ chương trình TLS đang chạy để đưa vào `validate()`, `apply_action()` áp một `Action` đã validate vào SUMO qua `trafficlight.setProgramLogic` (dùng `conn.trafficlight.Phase`/`Logic` — lớp riêng của từng backend traci/libsumo, không phải lớp dùng chung, đã kiểm chứng cả hai backend).
+- `baselines/fixed.py`: `decide()` luôn trả `[]` — không đụng gì tới đèn, chạy nguyên `<tlLogic type="static">` có sẵn.
+- `baselines/actuated.py`: `decide()` cũng luôn trả `[]`. Toàn bộ hành vi nằm ở **file mạng riêng** `networks/grid_4x4/net_actuated.xml` + `sim_actuated.sumocfg`, sinh một lần bằng `netconvert --sumo-net-file net.xml --tls.rebuild --tls.default-type actuated --tls.min-dur 7 --tls.max-dur 90 -o net_actuated.xml` (min/max khớp `HARD_CONSTRAINTS` ở Bước 7). **Phát hiện quan trọng**: đổi `type` của một `tlLogic` đang chạy sang `actuated` bằng TraCI (`setProgramLogic`) **không** hoạt động như actuated thật — SUMO chỉ tự sinh detector cảm biến (induction loop) khi **nạp** một mạng có sẵn `type="actuated"` từ file, không phải khi đổi type giữa chừng qua API. Đã kiểm chứng trực tiếp: đổi qua TraCI → pha xanh vẫn cố định y hệt static (42s mỗi lần); nạp từ `net_actuated.xml` → pha xanh dao động thật theo nhu cầu (quan sát được 7-10s+ thay vì hằng số 42s).
+- `sim/runner.py`: thêm `make_controller(mode, conn)`, chọn `sim_actuated.sumocfg` khi `mode=actuated` (còn lại dùng `sim.sumocfg`), thêm `CONTROL_INTERVAL_S=90` (bằng đúng 1 chu kỳ đèn của `grid_4x4`) — tại mỗi mốc lấy mẫu metric trùng với mốc quyết định, gọi `controller.decide()`, đưa từng action qua `validate()` (Bước 7) rồi `apply_action()` nếu hợp lệ, ghi mọi quyết định vào bảng `decisions` (đã có sẵn từ Bước 4: `validator_status`, `validator_violations`, `applied`). Baseline có thêm hook tùy chọn `observe(snapshot, sim_time)` — gọi mỗi 10s (không nằm trong `Controller` protocol dùng chung, chỉ `maxpressure` cần) — lý do ở dưới.
+- `baselines/maxpressure.py`: pressure theo đúng định nghĩa Max-Pressure (`getLastStepHaltingNumber` vào trừ ra, theo từng phase xanh, tra cứu qua `trafficlight.getControlledLinks`), nhưng **cách dùng pressure khác bản gốc** vì không gian hành động ở đây hẹp hơn (chỉnh split, không tự do chọn phase) — mỗi chu kỳ chỉ nhích `AdjustPhaseSplit` một bước cố định (`_STEP_S`) từ phase ít áp lực nhất sang phase nhiều áp lực nhất, nếu chênh lệch vượt ngưỡng (`_MIN_PRESSURE_DIFF`).
 
-**DoD**: cả 3 chạy hết 3600s · `maxpressure` tốt hơn `fixed` về mean waiting time (nếu không, nó đang sai)
+**Sự cố trong lúc verify (đáng ghi lại)**: 3 lần triển khai đầu của `maxpressure` đều **thua** `fixed` (7.31s, 9.29s, rồi 6.97s so với `fixed` 6.49s) — vi phạm thẳng DoD. Nguyên nhân, tìm ra qua đo trực tiếp:
+
+1. `getLastStepHaltingNumber` là một lần đọc tức thời, còn chu kỳ quyết định (90s) trùng khít chu kỳ đèn (90s) → `decide()` luôn rơi vào đúng một điểm cố định trong chu kỳ mỗi lần (ngay sau khi phase vừa kết thúc hàng chờ đầy nhất, phase vừa chạy hàng chờ rỗng nhất) → tín hiệu bị lệch có hệ thống, không phải nhiễu ngẫu nhiên.
+2. Nhảy thẳng tới "tỉ lệ lý tưởng" mỗi chu kỳ (chia lại toàn bộ thời gian xanh theo đúng tỉ lệ áp lực đo được) quá mạnh tay — một lần đo áp lực bằng 0 (rất dễ xảy ra) đẩy phase đó về thời lượng xanh gần 0, gây dao động dữ dội giữa các chu kỳ (đã thấy `delta_s` nhảy +42 rồi -57 rồi +42... liên tục).
+
+**Cách sửa**: (a) thêm `observe()` gọi mỗi 10s, **lấy trung bình áp lực trên toàn bộ khoảng 90s** thay vì đọc một lần tại đúng lúc `decide()` chạy — sửa đúng gốc rễ của lệch hệ thống; (b) bỏ hẳn kiểu "nhảy tới tỉ lệ lý tưởng", thay bằng bước nhích cố định nhỏ (`_STEP_S=5.0`, dưới xa `max_delta_per_cycle_s=15`), chỉ nhích khi chênh lệch áp lực vượt ngưỡng (`_MIN_PRESSURE_DIFF=4.0`) — không bao giờ đề xuất thứ cực đoan. Đã rà một vùng tham số xung quanh giá trị chọn để xác nhận đây là một vùng thắng ổn định (nhiều tổ hợp lân cận đều thắng `fixed`), không phải một điểm may mắn do overfit vào đúng 1 seed.
+
+**Verify** (qua đúng `sim.runner` CLI + Postgres, không phải script tạm):
+
+```bash
+python -m sumo_agents.sim.runner --scenario grid_4x4 --mode fixed --seed 42        # mean_waiting_s = 6.4941
+python -m sumo_agents.sim.runner --scenario grid_4x4 --mode actuated --seed 42     # mean_waiting_s = 2.8100
+python -m sumo_agents.sim.runner --scenario grid_4x4 --mode maxpressure --seed 42  # mean_waiting_s = 6.2247
+```
+
+Cả 3 chạy hết 3600s (thực tế ~3800-3820s do xe chạy nốt, như Bước 5). `maxpressure` (6.22s) tốt hơn `fixed` (6.49s) ~4.2%; `actuated` (2.81s) — đối thủ thật sự — vượt trội cả hai, đúng kỳ vọng của plan (actuated phản ứng theo từng bước mô phỏng qua detector thật, còn `maxpressure` ở đây chỉ được quyết định mỗi 90s trong một không gian hành động cố ý hẹp).
+
+`tests/test_baselines.py`: test thuần cho phần logic không cần SUMO (`phase_kind`, `phase_deltas`, `fixed`/`actuated` luôn `decide()`→`[]`) — không lặp lại việc chạy 3600s thật trong CI vì tốn thời gian và cần SUMO.
+
+**DoD**: cả 3 chạy hết 3600s (✅) · `maxpressure` tốt hơn `fixed` về mean waiting time (✅, 6.22s so với 6.49s) — **đã đạt**.
 
 ---
 

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  grid_4x4 — "actuated" baseline variant (STEPS.md Step 8).
+
+  Identical to sim.sumocfg (same edges/junctions/demand/incidents, see
+  that file) except net-file: net_actuated.xml has every junction's
+  tlLogic type="static" converted to type="actuated" (SUMO's built-in
+  gap-based controller), generated once via netconvert with these
+  options: sumo-net-file=net.xml, tls.rebuild, tls.default-type=actuated,
+  tls.min-dur=7, tls.max-dur=90, output=net_actuated.xml.
+
+  min-dur/max-dur match HARD_CONSTRAINTS["min_green_s"/"max_green_s"] in
+  safety/validator.py, so the actuated baseline operates within the same
+  green-time bounds an agent would be allowed to use: a fair comparison.
+
+  This is the ONLY difference from fixed: baselines/actuated.py's Controller
+  never emits an Action. SUMO's own actuated algorithm (auto-generated
+  induction-loop detectors at the stop line, since none are declared
+  explicitly) does all the work purely from this network file, verified
+  empirically that green durations vary per cycle (7 to 10s+) instead of
+  the fixed network's constant 42s.
+-->
+<sumoConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+    <input>
+        <net-file value="net_actuated.xml"/>
+        <route-files value="trips.xml"/>
+    </input>
+
+    <time>
+        <begin value="0"/>
+        <end value="3600"/>
+        <step-length value="1"/>
+    </time>
+
+    <processing>
+        <device.rerouting.probability value="1.0"/>
+    </processing>
+
+</sumoConfiguration>

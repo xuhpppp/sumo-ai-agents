@@ -1,14 +1,18 @@
-"""SimRunner -- bare async loop + metric collection (STEPS.md Step 5).
+"""SimRunner -- async loop + metric collection + controller wiring
+(STEPS.md Steps 5 and 8).
 
-`orchestrator` is not wired in yet (that's Phase 2, STEPS.md Steps 10-14) --
-this step only proves that the sim loop, metric sampling, and seeded
-incident injection are cheap, deterministic, and correctly persisted. The
-loop already has the async shape from plan section 3.2 (`await
-asyncio.sleep(0)` yielding the event loop every step) so Phase 2 only adds a
-`decide()` task inside it; it does not need to rewrite the loop.
+`orchestrator` (the LLM-driven mode) is not wired in yet (that's Phase 2,
+STEPS.md Steps 10-14) -- but the 3 deterministic baselines (Step 8) already
+plug into the exact same `Controller.decide(snapshot, sim_time) -> list[Action]`
+shape the LLM agent will use, applied through the SAME validator gate
+(Step 7). The loop already has the async shape from plan section 3.2
+(`await asyncio.sleep(0)` yielding the event loop every step) so Phase 2
+only adds a `decide()` task inside it; it does not need to rewrite the loop.
 
 Usage:
     python -m sumo_agents.sim.runner --scenario grid_4x4 --mode fixed --seed 42
+    python -m sumo_agents.sim.runner --scenario grid_4x4 --mode actuated --seed 42
+    python -m sumo_agents.sim.runner --scenario grid_4x4 --mode maxpressure --seed 42
 """
 
 from __future__ import annotations
@@ -17,8 +21,14 @@ import argparse
 import asyncio
 from pathlib import Path
 
+from sumo_agents.baselines.actuated import ActuatedController
+from sumo_agents.baselines.base import Controller
+from sumo_agents.baselines.fixed import FixedController
+from sumo_agents.baselines.maxpressure import MaxPressureController
 from sumo_agents.obs.db import make_async_engine, make_session_factory
 from sumo_agents.obs.store import Store
+from sumo_agents.safety.validator import validate
+from sumo_agents.sim.actuators import apply_action, read_tls_state
 from sumo_agents.sim.conn import Backend, SumoConnection
 from sumo_agents.sim.incidents import IncidentInjector, load_incident_schedule
 from sumo_agents.sim.state import collect_state, traffic_light_ids
@@ -27,12 +37,37 @@ from sumo_agents.sim.state import collect_state, traffic_light_ids
 # Matches plan section 6.1 / STEPS.md Step 5.
 METRIC_SAMPLE_INTERVAL_S = 10.0
 
+# How often a controller gets to decide (STEPS.md Step 8) -- one full grid_4x4
+# TLS cycle (42+3+42+3=90s, see net.xml), matching what "max_delta_per_cycle_s"
+# in safety/validator.py means by "per cycle". Must be a multiple of
+# METRIC_SAMPLE_INTERVAL_S so a decision point always lands on a metrics
+# sample (both are checked together, no extra TraCI round trip).
+CONTROL_INTERVAL_S = 90.0
+
 NETWORKS_DIR = Path(__file__).resolve().parents[3] / "networks"
+
+# mode -> .sumocfg filename under networks/<scenario>/. Only "actuated"
+# needs a different network file (net_actuated.xml -- every <tlLogic>
+# rebuilt to type="actuated" via netconvert, see sim_actuated.sumocfg's
+# header comment); every other mode controls the standard static network
+# via Action/validator instead.
+_SUMOCFG_BY_MODE: dict[str, str] = {"actuated": "sim_actuated.sumocfg"}
+_DEFAULT_SUMOCFG = "sim.sumocfg"
+
+
+def make_controller(mode: str, conn: SumoConnection) -> Controller:
+    if mode == "fixed":
+        return FixedController()
+    if mode == "actuated":
+        return ActuatedController()
+    if mode == "maxpressure":
+        return MaxPressureController(conn)
+    raise ValueError(f"unknown mode {mode!r} (Phase 2 will add 'llm')")
 
 
 async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> None:
     scenario_dir = NETWORKS_DIR / scenario
-    sumo_cfg = scenario_dir / "sim.sumocfg"
+    sumo_cfg = scenario_dir / _SUMOCFG_BY_MODE.get(mode, _DEFAULT_SUMOCFG)
     incidents_path = scenario_dir / "incidents.yaml"
 
     engine = make_async_engine()
@@ -49,6 +84,7 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> None
             config={
                 "gui": gui,
                 "metric_sample_interval_s": METRIC_SAMPLE_INTERVAL_S,
+                "control_interval_s": CONTROL_INTERVAL_S,
                 "n_incidents": len(incidents),
             },
         )
@@ -58,7 +94,16 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> None
         try:
             conn.start(sumo_cfg, seed=seed)
             junction_ids = traffic_light_ids(conn)
+            controller = make_controller(mode, conn)
+            # Optional per-controller hook, not part of the shared Controller
+            # protocol (baselines/base.py): called every metric-sample tick so a
+            # controller can average a signal over the whole control interval
+            # instead of reading it once at decide() time (STEPS.md Step 8 --
+            # MaxPressureController needs this, fixed/actuated don't define it).
+            controller_observe = getattr(controller, "observe", None)
             last_sample_time = -METRIC_SAMPLE_INTERVAL_S  # force sampling at t=0
+            last_control_time = -CONTROL_INTERVAL_S  # force a decision at t=0
+            cycle_id = 0
 
             # Standard TraCI loop condition: keep stepping while any vehicle
             # has departed-but-not-arrived or is still scheduled to depart.
@@ -85,6 +130,32 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> None
                             co2_mg=snapshot.co2_mg,
                         )
                     last_sample_time = sim_time
+
+                    if controller_observe is not None:
+                        controller_observe(snapshots, sim_time)
+
+                    if sim_time - last_control_time >= CONTROL_INTERVAL_S:
+                        for action in controller.decide(snapshots, sim_time):
+                            tls_state = read_tls_state(conn, action.junction_id)
+                            result = validate(action, tls_state)
+                            status = "ok" if result.ok else "rejected"
+                            if result.ok and result.violations:
+                                status = "clamped"
+                            if result.clamped_action is not None:
+                                apply_action(conn, result.clamped_action)
+                            await store.add_decision(
+                                run_id=run_id,
+                                sim_time=sim_time,
+                                cycle_id=cycle_id,
+                                junction_id=action.junction_id,
+                                action_type=action.type,
+                                params=action.model_dump(exclude={"type", "junction_id"}),
+                                validator_status=status,
+                                validator_violations={"violations": result.violations} if result.violations else None,
+                                applied=result.clamped_action is not None,
+                            )
+                        last_control_time = sim_time
+                        cycle_id += 1
 
                 await asyncio.sleep(0)  # yield the event loop (plan section 3.2)
 
