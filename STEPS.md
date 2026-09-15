@@ -26,7 +26,7 @@
 | 10 | `agents/llm.py` — call site duy nhất | 2 | 2h | ✅ |
 | 11 | `protocol.py` — schema Pydantic | 2 | 2h | ✅ |
 | 12 | `JunctionAgent` (vòng 1: observe) | 2 | 4h | ✅ |
-| 13 | Coalition + `SupervisorAgent` (vòng 2–4) | 2 | 5h | ⬜ |
+| 13 | Coalition + `SupervisorAgent` (vòng 2–4) | 2 | 5h | ✅ |
 | 14 | Nối vào SimRunner, chạy full 1h | 2 | 3h | ⬜ |
 | 15 | Backend dashboard + WebSocket | 3 | 3h | ⬜ |
 | 16 | 4 panel frontend | 3 | 5h | ⬜ |
@@ -428,16 +428,34 @@ Kết quả (grid_4x4, 3 seed):
 
 ---
 
-## Bước 13 · Coalition + `SupervisorAgent` (vòng 2–4)
+## Bước 13 · Coalition + `SupervisorAgent` (vòng 2–4) ✅
 
 **Mục tiêu**: hoàn thiện pipeline 4 vòng.
 
-- **Vòng 2 — coalition**: chỉ nút *đang tắc* mới lập nhóm và trao đổi với hàng xóm. **Tối đa 2 vòng**. Nút thông thoáng im lặng → đây là cơ chế cắt 50–70% chi phí
-- **Vòng 3 — validate**: gọi `validator.py` Bước 7. **Tất định, chạy trước supervisor.** Đề xuất vi phạm bị chặn thẳng, không lên supervisor
-- **Vòng 4 — approve**: `SupervisorAgent` giải xung đột giữa các nút (2 nút cùng xin ưu tiên ngược chiều) → `Verdict`
-- Ghi `messages` + `decisions` đầy đủ, mọi vòng
+**Cơ chế vòng 2 (coalition) — quyết định thiết kế cụ thể hoá "tối đa 2 vòng"**: plan chỉ nêu tên vòng, không nói rõ cơ chế bên trong, nên đã cụ thể hoá như sau — không phải 2 lượt gọi LLM cho mỗi cặp, mà là:
+- **Bước A (broadcast, KHÔNG gọi LLM)**: nút *đang tắc* (Proposal ở vòng 1 có `action.type != "no_action"`) relay thẳng đề xuất + rationale của chính nó (đã có sẵn từ vòng 1) tới các hàng xóm **đang là agent LLM trong run này** (tra bằng `agents/topology.py`, giao với tập agent đang chạy — không gửi cho hàng xóm không có agent). Không hỏi lại "bạn muốn làm gì" lần 2 vì dư thừa.
+- **Bước B (reply, 1 lệnh gọi LLM thật/tin nhắn đến)**: mỗi nút nhận được tin nhắn trả lời **thật** bằng `JunctionAgent.reply()` — chọn 1 trong 5 `intent` (report/request_help/propose/ack/object) kèm rationale tiếng Việt, có xét đến trạng thái hiện tại của chính nó + nội dung tin nhắn đến (bọc `wrap_untrusted_data`, vì đây là nội dung do agent khác — không phải code tất định — sinh ra).
+- Không có vòng thứ 3 nào nút gửi lại phản hồi cho bên gửi ban đầu — dừng ở đây, đúng nghĩa "tối đa 2 vòng trao đổi". Nút thông thoáng (`no_action`) không bao giờ broadcast → đúng cơ chế cắt chi phí đã nêu trong plan.
+- Bản thân Proposal **không bị coalition sửa đổi** — coalition chỉ làm giàu ngữ cảnh (tin nhắn) cho `SupervisorAgent` ở vòng 4, nơi thực sự có quyền approve/modify/deny. Ví dụ cụ thể "2 nút cùng xin ưu tiên ngược chiều" trong plan chính là lúc một tin nhắn `object` xuất hiện ở vòng 2 và supervisor phải cân nhắc nó ở vòng 4.
 
-**DoD**: 1 chu kỳ hoàn chỉnh sinh ra: N `messages`, N `decisions` có `validator_status` và `supervisor_verdict` · inject một action cố ý vi phạm → bị `rejected` **trước** khi tới supervisor
+**Đã làm**:
+- `src/sumo_agents/agents/supervisor.py` — `SupervisorAgent`: **một instance, một lệnh gọi LLM mỗi chu kỳ** (không phải mỗi nút — đúng phân bổ model `gpt-5.6-terra`/`effort=medium` ở plan §1.2, vì giải xung đột cần nhìn toàn cảnh). `review(candidates, messages, sim_time) -> (dict[junction_id, Verdict], Usage | None)` — `Usage=None` khi không có candidate nào (không tốn 1 lệnh gọi cho câu hỏi rỗng). Luôn trả đủ 1 `Verdict`/candidate: nếu model bỏ sót hoặc lỗi, mặc định `approved` (an toàn vì action đã qua `validator.py` rồi — không phải bypass an toàn, chỉ là chấp nhận cái đã biết là an toàn).
+- `src/sumo_agents/agents/orchestrator.py` — `run_decision_cycle(proposals, agents, neighbor_map, snapshots, tls_states, supervisor, ...)`: nhận **Proposal của vòng 1 làm input** (không tự chạy lại `observe()`) — tách biệt rõ vòng 1 (Bước 12, độc lập từng nút) khỏi vòng 2-4 (cần nhìn cả chu kỳ), đồng thời cho phép script kiểm chứng DoD **tự tạo Proposal**, kể cả một cái cố ý vi phạm (không có cách nào bắt LLM thật trả về action sai theo yêu cầu). Chạy tuần tự đúng 4 vòng, ghi `messages`/`decisions`/`llm_calls` đầy đủ.
+- `Verdict` (`protocol.py`) thêm field `junction_id` — cần thiết vì giờ 1 lệnh gọi supervisor trả về **danh sách** verdict cho nhiều nút cùng lúc, không phải 1 verdict/lệnh gọi như bản phác thảo ở Bước 11.
+- `JunctionAgent.reply()` (`junction.py`) — method mới cho vòng 2's Bước B. Dùng chung system prompt/cache_key với `observe()` (cùng 1 agent identity), chỉ khác schema (`Proposal` ↔ nay là `_CoalitionReplyDecision` sau khi sửa lỗi bên dưới).
+
+**⚠️ Lỗi thật thứ hai phát hiện khi chạy DoD** (cùng nhóm nguyên nhân với lỗi `oneOf` ở Bước 12): `Message.payload: dict` — một dict **mở** (không key cố định) — bị OpenAI Structured Outputs từ chối: `'additionalProperties' is required to be supplied and to be false`. Vì `dict` mở về bản chất không thể ép `additionalProperties: false` (làm vậy thì nó rỗng, mất hết ý nghĩa), nên **mọi field kiểu `dict` không có schema cố định đều không dùng được làm `text_format` cho `ask()`**. Lỗi này không lộ ra ở Bước 11 (chỉ test Pydantic cục bộ) và suýt không lộ ra ở Bước 13 nữa — vì `JunctionAgent.reply()` có sẵn cơ chế fallback "sim không chờ LLM" nên cả 6/6 lệnh gọi `reply()` thật đều lỗi 400 nhưng **âm thầm rơi về `ack` mặc định**, script DoD vẫn in ra tin nhắn "hợp lệ" và PASS ở lần chạy đầu — chỉ lộ ra khi tra trực tiếp cột `llm_calls.error` trong Postgres.
+- **Sửa tận gốc**: nhận ra model thực sự chỉ cần quyết định `intent` + `rationale` cho một reply — `sender`/`recipients` vốn đã tất định (đã biết chắc), và `payload` chưa từng được dùng cho reply. Thay vì cố ép `payload` thành schema hợp lệ, bỏ hẳn việc hỏi model 2 field đó: thêm schema riêng, hẹp `_CoalitionReplyDecision(intent, rationale)` (private, trong `junction.py`) chỉ cho `reply()`; `Message` đầy đủ được `JunctionAgent` tự dựng lại từ id đã biết + intent/rationale model trả về. Bump `cache_key` → `v3` (system prompt đổi mô tả output format cho khớp).
+- **Bài học bổ sung cho `oneOf`-lesson ở Bước 12**: không chỉ union có discriminator, mà **bất kỳ field `dict`/map mở nào** cũng không dùng được làm `text_format`. Kiểm tra lại: `Proposal`, `Verdict` (qua `_SupervisorReview`) không có field dict mở nào → an toàn. Nguyên tắc chung rút ra: **mọi schema Pydantic dùng làm `text_format` phải toàn bộ field kiểu cố định** (model/union/list/scalar), không có `dict` tự do ở bất kỳ đâu trong cây kiểu.
+
+**Test**: `tests/test_supervisor.py` (6 test, fake client — không gọi mạng, không candidate thì không gọi `ask()`, mặc định `approved` khi model bỏ sót/lỗi/trả về id lạ) + `tests/test_orchestrator.py` (4 test, dùng `store` fixture SQLite in-memory có sẵn từ Bước 4 + fake `JunctionAgent`/`SupervisorAgent` — test đúng logic của `orchestrator.py`: ai broadcast, ai reply ai, action vi phạm bị chặn trước supervisor, ghi DB đúng) + 2 test mới cho `JunctionAgent.reply()` trong `test_junction.py`. Toàn suite: 93 passed.
+
+**Kiểm chứng DoD** (`python scripts/verify_coalition.py` — 6 agent thật, Proposal vòng 1 **trộn**: 4 từ LLM thật (đều `no_action`, đúng như quan sát ở Bước 12 vì traffic còn nhẹ ở t=90s), B1 dựng tay hợp lệ (kích hoạt coalition), C1 dựng tay **cố ý vi phạm** (chỉnh pha vàng) — vì không có cách nào ép LLM thật trả về action sai theo yêu cầu; vòng 2 (reply) và vòng 4 (supervisor) đều là lệnh gọi LLM thật):
+- **Lần chạy đầu**: PASS về mặt logic nhưng phát hiện lỗi `payload: dict` nêu trên (6/6 reply lỗi 400, fallback che mất). Sửa xong, chạy lại.
+- **Lần chạy sau**: PASS sạch, **0 lỗi** trong toàn bộ 11 lệnh gọi LLM thật (4 observe + 6 reply + 1 supervisor). 6 `decisions`, 8 `messages` (2 broadcast + 6 reply). C1: `validator_status=rejected`, `supervisor_violations` nêu rõ "phase '1' is 'yellow'...", `supervisor_verdict=None` — **đúng yêu cầu DoD, chưa từng tới supervisor**. 5 nút còn lại đều có `supervisor_verdict` (đa số `approved`, kể cả B1's `adjust_phase_split` — supervisor đọc đúng ngữ cảnh: các tin nhắn `object` từ C1/B1/C0/C2 chỉ đang bác yêu cầu **không hợp lệ** của C1, không phải xung đột hành lang thật, nên không có gì cần `modified`/`denied` ở chu kỳ này — lý giải bằng tiếng Việt cụ thể, đúng số liệu).
+- Cache: supervisor's `cached_tokens=1113` ở lần gọi thứ 2 trong session (cache theo `cache_key` bền qua nhiều run riêng biệt, không chỉ trong 1 run — đúng như tài liệu OpenAI).
+- Cost: ~$0.013 cho 11 lệnh gọi thật (lần chạy sạch).
+- Dọn 1 run lỗi (do bug, trước khi sửa) khỏi Postgres.
 
 ---
 

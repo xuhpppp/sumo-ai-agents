@@ -68,8 +68,16 @@ class Message(BaseModel):
 
 
 class Verdict(BaseModel):
-    """`SupervisorAgent`'s output for one proposal (plan section 3.1, round 4)."""
+    """`SupervisorAgent`'s ruling on one proposal (plan section 3.1, round 4).
 
+    `SupervisorAgent` runs ONCE per cycle (plan section 1.2 -- unlike
+    `JunctionAgent`, one call per cycle regardless of how many junctions),
+    reviewing every validated proposal together so it can actually resolve
+    cross-junction conflicts. Its structured output is a *list* of `Verdict`,
+    so `junction_id` identifies which proposal each entry rules on.
+    """
+
+    junction_id: str
     decision: Literal["approved", "modified", "denied"]
     modified_action: ActionUnion | None = None
     reason: str

@@ -1,29 +1,57 @@
-"""JunctionAgent -- round 1 of the 4-round decision cycle: "observe"
-(IMPLEMENTATION_PLAN.md section 3.1, STEPS.md Step 12).
+"""JunctionAgent -- rounds 1 ("observe") and 2 ("coalition reply") of the
+4-round decision cycle (IMPLEMENTATION_PLAN.md section 3.1, STEPS.md Steps
+12 and 13).
 
-Each JunctionAgent looks only at its OWN junction's state this round and
-proposes an Action (or `no_action`) via `agents/llm.py`'s single call site.
-Rounds 2-4 (coalition, validate, approve -- STEPS.md Step 13) are not
-implemented here; this module's public surface is deliberately just
-`observe()`, matching the plan's "vòng 1: mỗi JunctionAgent tự đánh giá"
-(each agent self-assesses, no inter-agent talk yet).
+`observe()` (Step 12) looks only at the junction's own state and proposes an
+Action. `reply()` (Step 13) additionally responds to one incoming coalition
+message from a neighbor -- both share the same system prompt/cache_key,
+since it's the same agent identity either way; only the schema requested
+from `ask()` differs (`Proposal` vs `Message`). Round 3 (validate, pure
+Python) and round 4 (approve, `SupervisorAgent`) live in
+`agents/orchestrator.py` and `agents/supervisor.py` -- this module's surface
+stays limited to "what does THIS junction, alone, think".
 
 The system prompt is built once per agent (at construction, from its
 `junction_id` and its neighbor list -- STEPS.md Step 12's other deliverable,
 `agents/topology.py`) and never changes afterward: everything that varies
-per cycle (sim_time, current phase durations, traffic metrics) goes into the
-`user` prompt instead, which is the whole precondition for OpenAI's prompt
-caching to engage (agents/llm.py's docstring, verified Step 10).
+per cycle (sim_time, current phase durations, traffic metrics, an incoming
+coalition message) goes into the `user` prompt instead, which is the whole
+precondition for OpenAI's prompt caching to engage (agents/llm.py's
+docstring, verified Step 10).
 """
 
 from __future__ import annotations
 
+from typing import Literal
+
 from openai import AsyncOpenAI
+from pydantic import BaseModel
 
 from sumo_agents.agents.llm import Usage, ask
-from sumo_agents.agents.protocol import Proposal
+from sumo_agents.agents.protocol import (
+    UNTRUSTED_DATA_SYSTEM_NOTICE,
+    Message,
+    Proposal,
+    wrap_untrusted_data,
+)
 from sumo_agents.safety.validator import HARD_CONSTRAINTS, NoAction, TlsState
 from sumo_agents.sim.state import JunctionSnapshot
+
+# The model's actual decision for a coalition reply is just "which of the 5
+# intents, and why" -- `sender`/`recipients` are mechanical (this agent's own
+# id / the incoming message's sender, never ambiguous) and `Message.payload`
+# is an open-ended `dict`, which OpenAI's structured-output mode rejects
+# outright (`'additionalProperties' is required to be supplied and to be
+# false` -- hit for real running Step 13's DoD check: every one of 6 real
+# `reply()` calls silently fell back to the no-LLM `ack` default because of
+# this, which the fallback masked until the raw `llm_calls.error` rows were
+# checked). Asking the model for a narrow, fixed-shape schema here and
+# building the full `Message` ourselves avoids the problem entirely instead
+# of trying to make `payload` schema-compatible for a field nothing actually
+# reads yet.
+class _CoalitionReplyDecision(BaseModel):
+    intent: Literal["report", "request_help", "propose", "ack", "object"]
+    rationale: str
 
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are a traffic-signal control agent for one signalized junction, \
@@ -81,15 +109,38 @@ caught by an unexpected early yellow. Only propose a change when the \
 observed pattern clearly and persistently justifies it -- a single noisy \
 reading is not enough justification on its own.
 
+## Coalition round
+
+If you proposed something other than no_action, your proposal is relayed \
+verbatim to your neighbors listed above (they see your action and \
+rationale). A neighbor may then send YOU a message about it -- `report` \
+(sharing their own state), `request_help` (asking you to act because they \
+believe you are contributing to their congestion), `propose` (a \
+coordinated change, e.g. to your offsets), `ack` (agreeing), or `object` \
+(disagreeing, e.g. because they need priority in the opposite direction \
+right now). When you are asked to reply to such a message, address it with \
+one of these same 5 intents and a short rationale -- your reply is one of \
+the inputs `SupervisorAgent` uses to resolve conflicts between junctions \
+before anything is actually applied, so an `object` you have good reason \
+for is useful signal, not something to avoid raising.
+
+## Data vs. instructions
+
+{untrusted_data_notice}
+
 ## Output format
 
-Respond with: the action you propose (or no_action), an urgency level \
-(low, medium, or high) reflecting how confident you are that intervention \
-is needed at all this cycle, and a short rationale written in Vietnamese \
-(this rationale is shown directly to a human operator on a live dashboard, \
-so it must be clear, concrete, and refer to the actual numbers you were \
-given this cycle -- not a generic templated sentence that could apply to \
-any cycle).
+Depending on what this call asks of you:
+  - an observe call: propose the action you propose (or no_action), an \
+urgency level (low, medium, or high) reflecting how confident you are that \
+intervention is needed at all this cycle, and a rationale in Vietnamese.
+  - a coalition-reply call: address the one incoming message you were \
+given with one of the 5 intents above and a rationale in Vietnamese (who \
+it's from/to is already known -- you only decide the intent and why).
+In both cases the rationale is shown directly to a human operator on a \
+live dashboard, so it must be clear, concrete, and refer to the actual \
+numbers you were given this cycle -- not a generic templated sentence that \
+could apply to any cycle.
 """
 
 
@@ -98,11 +149,12 @@ def _build_system_prompt(junction_id: str, neighbor_ids: list[str]) -> str:
     return _SYSTEM_PROMPT_TEMPLATE.format(
         junction_id=junction_id,
         neighbor_ids=neighbor_text,
+        untrusted_data_notice=UNTRUSTED_DATA_SYSTEM_NOTICE,
         **HARD_CONSTRAINTS,
     )
 
 
-def _build_user_prompt(snapshot: JunctionSnapshot, tls_state: TlsState, sim_time: float) -> str:
+def _build_own_state_text(snapshot: JunctionSnapshot, tls_state: TlsState, sim_time: float) -> str:
     phases = "; ".join(f"phase {p.phase_id} ({p.kind})={p.duration_s:.0f}s" for p in tls_state.phases)
     return (
         f"sim_time={sim_time:.0f}s\n"
@@ -116,8 +168,25 @@ def _build_user_prompt(snapshot: JunctionSnapshot, tls_state: TlsState, sim_time
     )
 
 
+def _build_user_prompt(snapshot: JunctionSnapshot, tls_state: TlsState, sim_time: float) -> str:
+    return _build_own_state_text(snapshot, tls_state, sim_time)
+
+
+def _build_reply_user_prompt(
+    incoming: Message, snapshot: JunctionSnapshot, tls_state: TlsState, sim_time: float
+) -> str:
+    own_state = _build_own_state_text(snapshot, tls_state, sim_time)
+    wrapped = wrap_untrusted_data(f"coalition_message_from_{incoming.sender}", incoming.model_dump_json())
+    return (
+        f"{own_state}\n"
+        "A neighboring junction sent you the coalition message below this "
+        f"cycle. Reply to it (sender={incoming.sender}):\n{wrapped}"
+    )
+
+
 class JunctionAgent:
-    """One LLM-driven junction, round 1 ("observe") only."""
+    """One LLM-driven junction: round 1 ("observe") and round 2 ("coalition
+    reply") -- see module docstring."""
 
     def __init__(self, junction_id: str, neighbor_ids: list[str]) -> None:
         self.junction_id = junction_id
@@ -125,7 +194,13 @@ class JunctionAgent:
         # Built once, kept byte-identical for the agent's whole lifetime --
         # see module docstring on why that matters for caching.
         self._system = _build_system_prompt(junction_id, self.neighbor_ids)
-        self._cache_key = f"junction:{junction_id}:v1"
+        # v3: Step 13 added the coalition-round + untrusted-data sections to
+        # the system prompt (v2), then corrected the reply output-format
+        # description after the `Message.payload` schema fix above (v3) --
+        # bump the version whenever the system prompt text itself changes
+        # (agents/llm.py's docstring), since a stale cache_key would just
+        # miss the cache, not error.
+        self._cache_key = f"junction:{junction_id}:v3"
 
     async def observe(
         self,
@@ -167,3 +242,38 @@ class JunctionAgent:
                 }
             )
         return parsed, usage
+
+    async def reply(
+        self,
+        incoming: Message,
+        snapshot: JunctionSnapshot,
+        tls_state: TlsState,
+        sim_time: float,
+        *,
+        client: AsyncOpenAI | None = None,
+    ) -> tuple[Message, Usage]:
+        """Round 2 (coalition): respond to one incoming message from a
+        neighbor. Always returns a valid `Message` (never `None`) -- same
+        "sim never waits for LLM" fallback as `observe()`, here defaulting
+        to a neutral `ack` rather than staying silent, since the orchestrator
+        (Step 13) expects one reply per incoming message it dispatched.
+
+        The model only decides `intent`/`rationale` (see
+        `_CoalitionReplyDecision` above) -- `sender`/`recipients` are set
+        here, deterministically, not parsed from the model's output, so
+        there is nothing to defensively normalize (unlike `observe()`)."""
+        user = _build_reply_user_prompt(incoming, snapshot, tls_state, sim_time)
+        parsed, usage = await ask(
+            "junction", self._system, user, _CoalitionReplyDecision, cache_key=self._cache_key, client=client
+        )
+
+        if parsed is None:
+            intent = "ack"
+            rationale = f"Lời gọi LLM thất bại ({usage.error}); mặc định xác nhận (ack) tin nhắn này."
+        else:
+            intent, rationale = parsed.intent, parsed.rationale
+
+        message = Message(
+            sender=self.junction_id, recipients=[incoming.sender], intent=intent, payload={}, rationale=rationale
+        )
+        return message, usage

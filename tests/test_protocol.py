@@ -104,17 +104,18 @@ def test_message_round_trips_and_rejects_bad_intent() -> None:
 
 
 def test_verdict_approved_does_not_need_a_modified_action() -> None:
-    verdict = Verdict(decision="approved", reason="Trong giới hạn an toàn.")
+    verdict = Verdict(junction_id="J07", decision="approved", reason="Trong giới hạn an toàn.")
     assert verdict.modified_action is None
 
 
 def test_verdict_modified_without_modified_action_raises() -> None:
     with pytest.raises(ValidationError, match="modified_action"):
-        Verdict(decision="modified", reason="Cần giảm delta_s.")
+        Verdict(junction_id="J07", decision="modified", reason="Cần giảm delta_s.")
 
 
 def test_verdict_modified_with_action_is_valid() -> None:
     verdict = Verdict(
+        junction_id="J07",
         decision="modified",
         modified_action=AdjustPhaseSplit(junction_id="J07", phase_id="0", delta_s=5.0),
         reason="Giảm delta_s từ 15 xuống 5 để tránh dao động.",

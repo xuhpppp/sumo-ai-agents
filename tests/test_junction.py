@@ -10,7 +10,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from sumo_agents.agents.junction import JunctionAgent, _build_system_prompt
-from sumo_agents.agents.protocol import Proposal
+from sumo_agents.agents.protocol import Message, Proposal
 from sumo_agents.safety.validator import AdjustPhaseSplit, NoAction, PhaseState, TlsState
 from sumo_agents.sim.state import JunctionSnapshot
 
@@ -71,6 +71,13 @@ def test_system_prompt_is_byte_stable_and_mentions_the_real_neighbors() -> None:
     assert "A1, B0, B2, C1" in a
 
 
+def test_system_prompt_carries_the_untrusted_data_notice() -> None:
+    # Step 13: coalition messages are the first real untrusted content a
+    # JunctionAgent sees, so the notice must actually be in the prompt.
+    prompt = _build_system_prompt("B1", ["A1"])
+    assert "<<<UNTRUSTED_DATA" in prompt
+
+
 async def test_observe_returns_the_parsed_proposal_on_success() -> None:
     reply = Proposal(
         junction_id="B1",
@@ -117,6 +124,58 @@ async def test_observe_falls_back_to_no_action_on_llm_failure() -> None:
     assert usage.status == "error"
 
 
+_INCOMING = Message(
+    sender="A1",
+    recipients=["B1"],
+    intent="request_help",
+    payload={"type": "adjust_phase_split", "delta_s": 10.0},
+    rationale="A1 đang tắc, cần B1 hỗ trợ.",
+)
+
+
+async def test_reply_builds_the_message_from_the_models_intent_and_rationale() -> None:
+    # The model only decides `intent`/`rationale` now (protocol.Message's
+    # `payload: dict` isn't OpenAI-structured-output-compatible -- see
+    # junction.py's _CoalitionReplyDecision docstring); sender/recipients are
+    # always set deterministically, so there's nothing for the model to get
+    # wrong there anymore.
+    reply = SimpleNamespace(intent="object", rationale="B1 cần ưu tiên ngược hướng lúc này.")
+    client = _FakeClient(_fake_response(reply))
+    agent = JunctionAgent("B1", ["A1"])
+
+    message, usage = await agent.reply(_INCOMING, _SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
+
+    assert message.sender == "B1"
+    assert message.recipients == ["A1"]
+    assert message.intent == "object"
+    assert message.rationale == "B1 cần ưu tiên ngược hướng lúc này."
+    assert usage.status == "ok"
+
+
+async def test_reply_falls_back_to_ack_on_llm_failure() -> None:
+    client = _FakeClient(RuntimeError("boom"))
+    agent = JunctionAgent("B1", ["A1"])
+
+    message, usage = await agent.reply(_INCOMING, _SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
+
+    assert message.intent == "ack"
+    assert message.sender == "B1"
+    assert message.recipients == ["A1"]
+    assert usage.status == "error"
+
+
+async def test_reply_uses_the_same_system_prompt_and_cache_key_as_observe() -> None:
+    reply = SimpleNamespace(intent="report", rationale="x")
+    client = _FakeClient(_fake_response(reply))
+    agent = JunctionAgent("B1", ["A1"])
+
+    await agent.reply(_INCOMING, _SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
+
+    (call,) = client.responses.calls
+    assert call["prompt_cache_key"] == "junction:B1:v3"
+    assert call["input"][0]["content"] == agent._system
+
+
 async def test_observe_passes_cache_key_and_schema_through_to_ask() -> None:
     reply = Proposal(
         junction_id="B1",
@@ -130,7 +189,7 @@ async def test_observe_passes_cache_key_and_schema_through_to_ask() -> None:
     await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
 
     (call,) = client.responses.calls
-    assert call["prompt_cache_key"] == "junction:B1:v1"
+    assert call["prompt_cache_key"] == "junction:B1:v3"
     assert call["text_format"] is Proposal
     assert call["model"] == "gpt-5.6-luna"
     assert call["input"][0]["role"] == "system"
