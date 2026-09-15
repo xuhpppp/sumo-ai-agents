@@ -25,7 +25,7 @@
 | 9 | 🔒 Bảng so sánh baseline (harness chạy nhiều run) | 1 | 2h | ✅ |
 | 10 | `agents/llm.py` — call site duy nhất | 2 | 2h | ✅ |
 | 11 | `protocol.py` — schema Pydantic | 2 | 2h | ✅ |
-| 12 | `JunctionAgent` (vòng 1: observe) | 2 | 4h | ⬜ |
+| 12 | `JunctionAgent` (vòng 1: observe) | 2 | 4h | ✅ |
 | 13 | Coalition + `SupervisorAgent` (vòng 2–4) | 2 | 5h | ⬜ |
 | 14 | Nối vào SimRunner, chạy full 1h | 2 | 3h | ⬜ |
 | 15 | Backend dashboard + WebSocket | 3 | 3h | ⬜ |
@@ -391,26 +391,40 @@ Kết quả (grid_4x4, 3 seed):
 **Một thay đổi có chủ ý so với bản phác thảo trong plan**: plan gợi ý `Action` là `type: Literal[...] + params: dict` (xem khối code gốc từng ở đây). Thay vào đó, `src/sumo_agents/agents/protocol.py` **tái dùng thẳng** discriminated union đã có sẵn từ `safety/validator.py` (Bước 7: `AdjustPhaseSplit`, `SetCycleLength`, `SetOffset`, `RequestVms`, `NoAction`, mỗi loại có field kiểu riêng thay vì `dict` chung) — đúng như đã ghi chú trước ở Bước 7 rằng "có thể tái dùng... không phá vỡ gì". Lý do: `params: dict` không cho Pydantic validate được kiểu dữ liệu bên trong (model trả `delta_s: "nhiều"` vẫn parse "thành công" thành `dict`, chỉ vỡ khi validator xử lý logic) — union đã có sẵn thì `delta_s` sai kiểu sẽ raise ngay tại biên LLM, sớm hơn và rõ ràng hơn. `protocol.py` chỉ import các Action type, không import `validate()`, nên không tạo phụ thuộc ngược.
 
 **Đã làm** (`src/sumo_agents/agents/protocol.py`):
-- `ActionUnion = Annotated[Union[AdjustPhaseSplit, SetCycleLength, SetOffset, RequestVms, NoAction], Field(discriminator="type")]` — dùng `discriminator="type"` để Pydantic báo lỗi rõ ràng theo đúng tag khi `type` không hợp lệ, thay vì dồn lỗi của cả 5 nhánh union.
+- `ActionUnion = Union[AdjustPhaseSplit, SetCycleLength, SetOffset, RequestVms, NoAction]` — ban đầu dùng `Annotated[..., Field(discriminator="type")]`, **đã bỏ discriminator ở Bước 12** sau khi phát hiện lỗi thật (xem ghi chú ở Bước 12).
 - `Proposal`, `Message`, `Verdict` đúng theo plan §5, với `action`/`modified_action` dùng `ActionUnion` thay vì `dict`.
 - Thêm một ràng buộc nhỏ không có trong plan nhưng hợp lý về ngữ nghĩa: `Verdict` với `decision="modified"` mà `modified_action=None` sẽ raise ngay ở biên schema (`@model_validator`) — tránh trạng thái mơ hồ khi Bước 13/14 áp dụng verdict.
 - `wrap_untrusted_data(label, content)` + `UNTRUSTED_DATA_SYSTEM_NOTICE`: helper bọc dữ liệu ngoài (tên đường OSM — Bước 18, `ScenarioSpec` do model sinh — Bước 20, payload tin nhắn từ agent khác) trong delimiter `<<<UNTRUSTED_DATA label=...>>> ... <<<END_UNTRUSTED_DATA>>>`, đi kèm câu thông báo cố định để chèn vào `system` prompt — đúng plan §12.2 và nguyên tắc bảo mật của dự án (không tuân theo chỉ thị nhúng trong dữ liệu ngoài).
 
 **DoD**: `tests/test_protocol.py` — 11 test, pass. Bao gồm đúng case yêu cầu: JSON có `action.type` không nằm trong 5 loại hợp lệ → `pydantic.ValidationError` nêu rõ giá trị sai (`test_proposal_with_unknown_action_type_raises_clearly`), thiếu field bắt buộc, sai literal cho `urgency`/`intent`, và case `Verdict` tự định nghĩa thêm ở trên. Toàn suite: 69 passed.
 
+> ⚠️ **Lỗi phát hiện muộn hơn, ở Bước 12**: 11 test này chỉ test Pydantic thuần (`model_validate_json` cục bộ), **chưa từng gọi OpenAI thật** với `ActionUnion` làm schema. `Field(discriminator="type")` khiến Pydantic sinh JSON Schema dạng `oneOf` + `discriminator` (kiểu OpenAPI) — OpenAI Structured Outputs **từ chối `oneOf`** (`'oneOf' is not permitted`). Lỗi này chỉ lộ ra khi Bước 12 gọi `ask()` thật với `Proposal` làm `text_format`. Đã sửa bằng cách bỏ `discriminator`, dùng `Union` thường (Pydantic sinh `anyOf`, được OpenAI chấp nhận) — xác nhận bằng cách in `Proposal.model_json_schema()` và grep `oneOf`/`anyOf`. 11 test cũ vẫn pass nguyên (kể cả case "unknown action type raises clearly" — Pydantic smart-union không cần discriminator vẫn báo lỗi rõ giá trị sai). **Bài học cho các bước sau**: mọi Pydantic schema dùng làm `text_format` cho `ask()` phải được test với ít nhất 1 lời gọi OpenAI thật trước khi coi là xong, không chỉ test Pydantic cục bộ.
+
 ---
 
-## Bước 12 · `JunctionAgent` (vòng 1: observe)
+## Bước 12 · `JunctionAgent` (vòng 1: observe) ✅
 
 **Mục tiêu**: một agent nhìn trạng thái nút của mình và đề xuất hành động.
 
-- System prompt **bất biến từng byte** suốt run: vai trò, hình học nút, danh sách hàng xóm, ràng buộc, không gian hành động. Mọi thứ đổi theo chu kỳ đi vào `user`.
-- Suy ra tô-pô hàng xóm **từ mạng lưới** (`sumolib`), không hardcode, không all-to-all
-- Output: `Proposal`
+**Đã làm**:
+- `src/sumo_agents/agents/topology.py` — `signalized_neighbor_map(net_file) -> dict[junction_id, list[neighbor_id]]`: đọc `net.xml` bằng `sumolib.net.readNet`, với mỗi node `type="traffic_light"`, lấy các node liền kề (qua `getIncoming`/`getOutgoing`) mà cũng là `traffic_light` — **1-hop thật theo mạng lưới**, không hardcode, không all-to-all (verify: không nút nào có > tổng-1 hàng xóm, quan hệ đối xứng, khớp thủ công với `grid_4x4/net.xml`: `B1 -> [A1, B0, B2, C1]`).
+- `src/sumo_agents/agents/junction.py` — `JunctionAgent(junction_id, neighbor_ids)`:
+  - System prompt dựng **một lần** lúc khởi tạo (từ `junction_id` + `neighbor_ids` + `HARD_CONSTRAINTS` nội suy trực tiếp từ `safety.validator.HARD_CONSTRAINTS`, không gõ tay số để tránh lệch khi hằng số đổi), giữ **bất biến từng byte** suốt vòng đời agent — đúng điều kiện cache của Bước 10. Mọi thứ đổi theo chu kỳ (`sim_time`, độ dài từng pha hiện tại, `queue_len`, `mean_waiting_s`, `mean_speed`, `throughput`, `co2_mg`) nằm trong `user`, dựng lại mỗi lần gọi `observe()`.
+  - Độ dài pha hiện tại lấy từ `TlsState` thật (`sim/actuators.py`'s `read_tls_state`, có sẵn từ Bước 8) thay vì giả định cố định "42s/3s" — vì đó chỉ đúng cho `grid_4x4` hiện tại, không đúng cho `mixed_district`/`osm_real` sau này, và pha có thể đã bị agent khác chỉnh ở chu kỳ trước.
+  - `observe(snapshot, tls_state, sim_time) -> tuple[Proposal, Usage]`: **luôn** trả về `Proposal` hợp lệ, không bao giờ `None`. Nếu `ask()` thất bại (lỗi API/refusal) → rơi về `Proposal(action=NoAction(...), rationale="Lời gọi LLM thất bại...")`, đúng nguyên tắc "sim không chờ LLM" (Bước 10's docstring). Có chuẩn hoá phòng thủ: nếu model trả sai `junction_id` (ở `Proposal` hoặc `action`), ghi đè lại đúng ID thật — tránh định tuyến sai ở Bước 13/14 chỉ vì model "đọc nhầm" tên chính nó.
+  - `client=` injectable (giống `ask()`) để test không cần gọi mạng thật.
+- Vòng 2-4 (coalition/validate/approve) **chưa** làm — đúng phạm vi "vòng 1: observe" của bước này.
 
-**DoD**: 6 agent chạy 1 chu kỳ, sinh 6 `Proposal` hợp lệ · `cached_tokens > 0` từ chu kỳ thứ 2 · nút thông thoáng trả `no_action`
+**Test**: `tests/test_topology.py` (5 test, đọc thẳng `networks/grid_4x4/net.xml` thật — thuần XML parsing qua `sumolib`, không cần TraCI/SUMO chạy, nên vẫn nhanh/tất định như mọi unit test khác) + `tests/test_junction.py` (5 test, fake client như `test_llm.py`: system prompt bất biến, parse thành công, chuẩn hoá `junction_id` sai, fallback `no_action` khi lỗi, cache_key/schema truyền đúng xuống `ask()`). Toàn suite: 79 passed.
 
-> Nếu agent **không bao giờ** trả `no_action`, system prompt đang thúc nó hành động quá mức → sửa prompt, nếu không hệ thống sẽ dao động.
+**Kiểm chứng DoD** (`python scripts/verify_junction_agents.py` — 6 agent thật (`B0,B1,B2,C0,C1,C2`, một khối 2×3 liền kề để có hàng xóm thật cho Bước 13 sau này), chạy trên SUMO thật (`grid_4x4`, seed=42, libsumo), 2 chu kỳ 90s liên tiếp, gọi song song bằng `asyncio.gather` — đúng khuyến nghị đã đưa ra ở Bước 10):
+- **Lần chạy đầu FAIL** vì lỗi `ActionUnion`/`oneOf` nêu trên (không tốn tiền — OpenAI từ chối request trước khi tính phí, `cost_usd=None` toàn bộ). Đã sửa `protocol.py`, chạy lại.
+- **Lần chạy sau: PASS** — 6/6 `Proposal` hợp lệ cả 2 chu kỳ · `cached_tokens = [1212, 1218, 1218, 1212, 1218, 1218]` ở chu kỳ 2 (chu kỳ 1 đều `0`, đúng như dự kiến — chưa có gì để cache) · **cả 6/6 agent đều trả `no_action`** ở cả 2 chu kỳ, với `rationale` tiếng Việt cụ thể, có trích số liệu thật (vd B1: *"hàng đợi chỉ 8 xe... tốc độ trung bình 7,6 m/s... chưa có bằng chứng rõ ràng cần thay đổi"*) — khớp yêu cầu DoD "nút thông thoáng trả no_action" và không có dấu hiệu prompt thúc ép hành động.
+- Ghi chú: t=90s/180s là rất sớm trong run (mới ~110-220/4500 trip đã xuất phát), nên lưu lượng còn nhẹ ở toàn bộ 6 nút — hợp lý là chưa nút nào cần can thiệp. Bước 13/14 (hoặc một lần chạy thủ công lấy mẫu ở cửa sổ sự cố ~1200-1800s) sẽ là dịp thực sự thấy agent đề xuất `adjust_phase_split`/khác `no_action`.
+- Cost: ~$0.0039 cho 12 lời gọi thật (6 nút × 2 chu kỳ). Latency: 2.3–4.4s/lượt (khớp số liệu Bước 10).
+- Dọn 1 run thất bại (do bug, trước khi sửa) khỏi Postgres, giữ lại run pass.
+
+> Ghi chú đã đúng như cảnh báo trong bước này: nếu agent không bao giờ trả `no_action` mới là dấu hiệu xấu — ở đây ngược lại (luôn `no_action` vì traffic còn nhẹ), không phải vấn đề.
 
 ---
 

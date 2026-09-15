@@ -21,9 +21,9 @@ violation (validator.py still has zero knowledge of protocol.py or LLMs).
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, Union
+from typing import Literal, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, model_validator
 
 from sumo_agents.safety.validator import (
     AdjustPhaseSplit,
@@ -33,16 +33,18 @@ from sumo_agents.safety.validator import (
     SetOffset,
 )
 
-# `Field(discriminator="type")` makes Pydantic dispatch on the `type`
-# literal instead of trying each union member in order -- both a
-# (marginal) performance win and, more importantly, a much clearer
-# validation error when the model returns an unknown `type` value (it
-# names the exact tag and the allowed tags, rather than dumping every
-# member's mismatched-field errors at once).
-ActionUnion = Annotated[
-    Union[AdjustPhaseSplit, SetCycleLength, SetOffset, RequestVms, NoAction],
-    Field(discriminator="type"),
-]
+# NOT `Field(discriminator="type")`: that reads better locally (Pydantic
+# dispatches on the `type` literal instead of trying every union member,
+# and names the exact bad tag in a validation error) but it makes Pydantic
+# emit `oneOf` + an OpenAPI-style `discriminator` mapping in the JSON
+# schema -- and OpenAI's structured-output mode rejects `oneOf` outright
+# (`'oneOf' is not permitted`, hit for real running Step 12's DoD check
+# against the live API, not caught by Step 11's Pydantic-only tests). A
+# plain `Union` makes Pydantic emit `anyOf` instead, which OpenAI's
+# structured outputs do support -- this type is used as the literal
+# `text_format` schema handed to `ask()`, so it must satisfy OpenAI's
+# subset of JSON Schema, not just Pydantic's.
+ActionUnion = Union[AdjustPhaseSplit, SetCycleLength, SetOffset, RequestVms, NoAction]
 
 
 class Proposal(BaseModel):
