@@ -23,7 +23,7 @@
 | 7 | 🔒 `validator.py` + unit test | 1 | 3h | ✅ |
 | 8 | 3 baseline: fixed / actuated / maxpressure | 1 | 4h | ✅ |
 | 9 | 🔒 Bảng so sánh baseline (harness chạy nhiều run) | 1 | 2h | ✅ |
-| 10 | `agents/llm.py` — call site duy nhất | 2 | 2h | ⬜ |
+| 10 | `agents/llm.py` — call site duy nhất | 2 | 2h | ✅ |
 | 11 | `protocol.py` — schema Pydantic | 2 | 2h | ⬜ |
 | 12 | `JunctionAgent` (vòng 1: observe) | 2 | 4h | ⬜ |
 | 13 | Coalition + `SupervisorAgent` (vòng 2–4) | 2 | 5h | ⬜ |
@@ -356,18 +356,31 @@ Kết quả (grid_4x4, 3 seed):
 
 # PHASE 2 — Agent lõi
 
-## Bước 10 · `agents/llm.py` — call site duy nhất
+## Bước 10 · `agents/llm.py` — call site duy nhất ✅
 
 **Mục tiêu**: mọi lời gọi model đi qua đúng một hàm.
 
-- Theo §3.3 plan: `responses.parse` + `text_format` + `reasoning.effort` + `prompt_cache_key`
-- `MODELS` dict trong config: junction=`gpt-5.6-luna`/low · supervisor=`gpt-5.6-terra`/medium · scenario=`gpt-5.6-sol`/high
-- Ghi `llm_calls` **mọi lượt gọi**: tokens, cached_tokens, reasoning_tokens, latency, cost_usd
-- `obs/cost.py`: bảng giá §1.2 plan, tính cost tại chỗ
+**Đã làm**:
+- `src/sumo_agents/obs/cost.py`: bảng giá đúng §1.2 plan (`sol`/`terra`/`luna`, cả `gpt-6-astra` cho đầy đủ), `compute_cost_usd(model, *, input_tokens, cached_tokens, output_tokens)`. Lưu ý quan trọng khi tính: `cached_tokens` là **tập con** của `input_tokens` (không cộng dồn thêm), và `output_tokens` (OpenAI) **đã bao gồm** `reasoning_tokens` bên trong nó (breakdown, không phải phần cộng thêm) — xác nhận từ chính source của SDK (`ResponseUsage`/`OutputTokensDetails`), không đoán.
+- `src/sumo_agents/agents/llm.py`: hàm `ask(role, system, user, schema, *, cache_key, client=None)` — đúng theo §3.3 plan (`client.responses.parse` + `text_format` + `reasoning={"effort": ...}` + `prompt_cache_key`). `MODELS` dict: `junction`→(`gpt-5.6-luna`, `low`) · `supervisor`→(`gpt-5.6-terra`, `medium`) · `scenario`→(`gpt-5.6-sol`, `high`).
+  - `client` param cho phép inject fake client trong test (tests/test_llm.py dùng `SimpleNamespace`, không gọi mạng thật).
+  - **Không bao giờ raise ra ngoài** — lỗi API/refusal/parse fail trả về `(None, Usage(status="error", ...))`. Lý do: khớp nguyên tắc §3.2 "sim không bao giờ chờ LLM" — một JunctionAgent (Bước 12) sẽ coi `None` là tín hiệu để rơi về `no_action` cho chu kỳ đó, không phải crash cả vòng lặp quyết định.
+  - Đọc `OPENAI_API_KEY` qua `.env` (cùng pattern với `obs/db.py`'s `database_url()`: `load_dotenv(override=False)` rồi fail rõ ràng nếu thiếu, không fallback âm thầm).
+  - Xác nhận field usage chính xác từ source code SDK (`openai==3.10.0`) thay vì đoán: `usage.input_tokens_details.cached_tokens`, `usage.output_tokens_details.reasoning_tokens` — đúng như plan đã dự đoán, không cần đổi.
+- `Store.add_llm_call(...)` (đã có sẵn từ Bước 4) được gọi trực tiếp từ script kiểm tra (Bước 12+ sau này, mỗi agent sẽ tự gọi với đúng `run_id`/`sim_time`/`agent_id` của nó — `ask()` cố tình KHÔNG tự ghi DB, vì nó không biết ngữ cảnh run/cycle, giữ đúng single-responsibility: `ask()` chỉ gọi model, ai gọi `ask()` mới biết ghi vào đâu).
 
-**Việc đầu tiên khi chạy**: in nguyên `resp.usage` một lần, xác định đường dẫn chính xác của field cached tokens, rồi cố định trong code.
+**Việc đầu tiên khi chạy** (theo đúng plan): in nguyên `Usage` (bọc từ `resp.usage`) ở lượt gọi đầu tiên — xem `scripts/verify_llm_cache.py`.
 
-**DoD**: script gọi thử 3 lượt liên tiếp cùng system prompt → lượt 2, 3 có `cached_tokens > 0`. **Nếu vẫn bằng 0 thì dừng lại sửa** — cache 90% là khoản tiết kiệm lớn nhất của dự án.
+**Kiểm chứng DoD** (`python scripts/verify_llm_cache.py`, role=`junction`→`gpt-5.6-luna`, 3 lượt gọi thật, cùng `system` prompt):
+- **Lần chạy đầu tiên FAIL**: `input_tokens=707` (dưới ngưỡng cache ~1024 token của OpenAI) → `cached_tokens=[0, 0, 0]` cả 3 lượt. Đúng như checkpoint "dừng lại nếu fail" — không bỏ qua, đã tìm nguyên nhân: system prompt ban đầu quá ngắn.
+- Viết lại `SYSTEM_PROMPT` trong script dài và chi tiết hơn (topology, action space, safety constraints, format tin nhắn coalition, quy tắc data-vs-instruction) — bản nháp thực tế cho Bước 11/12 sau này, không chỉ để qua ngưỡng token. `input_tokens` tăng lên 1410.
+- **Lần chạy lại: PASS** — `cached_tokens = [0, 1348, 1348]` (lượt 1 chưa có gì để cache, lượt 2-3 hit gần hết phần system prompt bất biến). Cost mỗi lượt gọi: ~$0.0003–0.0005 (model `luna`, effort `low`).
+- Latency mỗi lượt: 3.1–4.9s — dữ liệu này quan trọng cho thiết kế Bước 12-14 (xem phần "Đề xuất" bên dưới).
+- Dọn 2 run "smoketest" không đạt/không hoàn chỉnh khỏi Postgres sau khi xác nhận, giữ lại 1 run pass làm bằng chứng.
+
+**Test**: `tests/test_cost.py` (5 test, tính tiền thuần logic, không gọi mạng) + `tests/test_llm.py` (7 test, dùng fake client injected qua `client=` param — test logic trích usage/tính cost/đường lỗi-không-raise của `ask()`, không test hành vi thật của OpenAI). Tổng suite: 58 passed.
+
+> 💡 **Đề xuất về tần suất/latency** (bạn đã mời góp ý ở bước này): với `effort="low"` trên `luna`, mỗi lượt gọi mất **3–5 giây thực** (không phải giây mô phỏng). Chu kỳ quyết định hiện tại là 90s **mô phỏng**, không phải 90s thực — SUMO chạy nhanh hơn thời gian thực rất nhiều (headless, `libsumo`), nên vòng lặp `sim/runner.py` có thể đi qua rất nhiều giây mô phỏng trong vài giây thực. Điều này củng cố đúng nguyên tắc §3.2 ("sim không bao giờ chờ LLM", cơ chế `skipped_cycle`) mà plan đã thiết kế sẵn — với 4-6 `JunctionAgent` gọi song song (asyncio, không tuần tự) mỗi 90s mô phỏng, tổng latency ~4s mỗi lượt là hoàn toàn khả thi để không bị dồn cục, miễn là các lệnh gọi thực sự chạy song song (`asyncio.gather`), không tuần tự từng agent một — tôi sẽ giữ nguyên tắc này khi làm Bước 12-14, sẽ nói rõ nếu cần đổi.
 
 ---
 
