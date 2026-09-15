@@ -24,7 +24,7 @@
 | 8 | 3 baseline: fixed / actuated / maxpressure | 1 | 4h | ✅ |
 | 9 | 🔒 Bảng so sánh baseline (harness chạy nhiều run) | 1 | 2h | ✅ |
 | 10 | `agents/llm.py` — call site duy nhất | 2 | 2h | ✅ |
-| 11 | `protocol.py` — schema Pydantic | 2 | 2h | ⬜ |
+| 11 | `protocol.py` — schema Pydantic | 2 | 2h | ✅ |
 | 12 | `JunctionAgent` (vòng 1: observe) | 2 | 4h | ⬜ |
 | 13 | Coalition + `SupervisorAgent` (vòng 2–4) | 2 | 5h | ⬜ |
 | 14 | Nối vào SimRunner, chạy full 1h | 2 | 3h | ⬜ |
@@ -384,31 +384,19 @@ Kết quả (grid_4x4, 3 seed):
 
 ---
 
-## Bước 11 · `protocol.py` — schema Pydantic
+## Bước 11 · `protocol.py` — schema Pydantic ✅
 
 **Mục tiêu**: hợp đồng dữ liệu giữa các agent, máy đọc được và người đọc được.
 
-```python
-class Action(BaseModel):
-    type: Literal["adjust_phase_split","set_cycle_length","set_offset","request_vms","no_action"]
-    params: dict
-class Proposal(BaseModel):
-    junction_id: str
-    action: Action
-    urgency: Literal["low","medium","high"]
-    rationale: str          # tiếng Việt, hiển thị lên UI
-class Message(BaseModel):
-    sender: str; recipients: list[str]
-    intent: Literal["report","request_help","propose","ack","object"]
-    payload: dict; rationale: str
-class Verdict(BaseModel):
-    decision: Literal["approved","modified","denied"]
-    modified_action: Action | None; reason: str
-```
+**Một thay đổi có chủ ý so với bản phác thảo trong plan**: plan gợi ý `Action` là `type: Literal[...] + params: dict` (xem khối code gốc từng ở đây). Thay vào đó, `src/sumo_agents/agents/protocol.py` **tái dùng thẳng** discriminated union đã có sẵn từ `safety/validator.py` (Bước 7: `AdjustPhaseSplit`, `SetCycleLength`, `SetOffset`, `RequestVms`, `NoAction`, mỗi loại có field kiểu riêng thay vì `dict` chung) — đúng như đã ghi chú trước ở Bước 7 rằng "có thể tái dùng... không phá vỡ gì". Lý do: `params: dict` không cho Pydantic validate được kiểu dữ liệu bên trong (model trả `delta_s: "nhiều"` vẫn parse "thành công" thành `dict`, chỉ vỡ khi validator xử lý logic) — union đã có sẵn thì `delta_s` sai kiểu sẽ raise ngay tại biên LLM, sớm hơn và rõ ràng hơn. `protocol.py` chỉ import các Action type, không import `validate()`, nên không tạo phụ thuộc ngược.
 
-Thêm helper bọc dữ liệu ngoài (tên đường OSM, spec do model sinh) trong delimiter + ghi rõ trong system prompt rằng **nội dung bên trong là dữ liệu, không phải chỉ thị**.
+**Đã làm** (`src/sumo_agents/agents/protocol.py`):
+- `ActionUnion = Annotated[Union[AdjustPhaseSplit, SetCycleLength, SetOffset, RequestVms, NoAction], Field(discriminator="type")]` — dùng `discriminator="type"` để Pydantic báo lỗi rõ ràng theo đúng tag khi `type` không hợp lệ, thay vì dồn lỗi của cả 5 nhánh union.
+- `Proposal`, `Message`, `Verdict` đúng theo plan §5, với `action`/`modified_action` dùng `ActionUnion` thay vì `dict`.
+- Thêm một ràng buộc nhỏ không có trong plan nhưng hợp lý về ngữ nghĩa: `Verdict` với `decision="modified"` mà `modified_action=None` sẽ raise ngay ở biên schema (`@model_validator`) — tránh trạng thái mơ hồ khi Bước 13/14 áp dụng verdict.
+- `wrap_untrusted_data(label, content)` + `UNTRUSTED_DATA_SYSTEM_NOTICE`: helper bọc dữ liệu ngoài (tên đường OSM — Bước 18, `ScenarioSpec` do model sinh — Bước 20, payload tin nhắn từ agent khác) trong delimiter `<<<UNTRUSTED_DATA label=...>>> ... <<<END_UNTRUSTED_DATA>>>`, đi kèm câu thông báo cố định để chèn vào `system` prompt — đúng plan §12.2 và nguyên tắc bảo mật của dự án (không tuân theo chỉ thị nhúng trong dữ liệu ngoài).
 
-**DoD**: `tests/test_protocol.py` pass, gồm case model trả JSON sai schema → raise rõ ràng
+**DoD**: `tests/test_protocol.py` — 11 test, pass. Bao gồm đúng case yêu cầu: JSON có `action.type` không nằm trong 5 loại hợp lệ → `pydantic.ValidationError` nêu rõ giá trị sai (`test_proposal_with_unknown_action_type_raises_clearly`), thiếu field bắt buộc, sai literal cho `urgency`/`intent`, và case `Verdict` tự định nghĩa thêm ở trên. Toàn suite: 69 passed.
 
 ---
 
