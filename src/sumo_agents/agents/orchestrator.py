@@ -30,6 +30,7 @@ from sumo_agents.agents.junction import JunctionAgent
 from sumo_agents.agents.llm import Usage
 from sumo_agents.agents.protocol import Message, Proposal
 from sumo_agents.agents.supervisor import SupervisorAgent, SupervisorCandidate
+from sumo_agents.agents.topology import NeighborLink
 from sumo_agents.obs.store import Store
 from sumo_agents.safety.validator import Action, TlsState, validate
 from sumo_agents.sim.state import JunctionSnapshot
@@ -72,14 +73,20 @@ async def run_decision_cycle(
     cycle_id: int,
     run_id: uuid.UUID,
     store: Store,
+    neighbor_links: dict[str, dict[str, NeighborLink]] | None = None,
     client: AsyncOpenAI | None = None,
 ) -> list[CycleDecision]:
     """Run rounds 2-4 for one decision cycle and persist every message and
     decision. `proposals`/`agents`/`snapshots`/`tls_states` must all be
     keyed by the same set of junction_ids (the active LLM-agent set for this
-    run)."""
+    run). `neighbor_links`: real distance/travel-time between adjacent
+    junctions (STEPS.md Step 14 coordination-context follow-up,
+    `agents/topology.neighbor_links`) -- `None`/omitted falls back to no
+    corridor context, same as before this existed (used by callers/tests
+    that don't have topology data, e.g. synthetic neighbor maps)."""
+    neighbor_links = neighbor_links or {}
     messages, message_usages = await _run_coalition_round(
-        proposals, agents, neighbor_map, snapshots, tls_states, sim_time=sim_time, client=client
+        proposals, agents, neighbor_map, snapshots, tls_states, neighbor_links, sim_time=sim_time, client=client
     )
     for m in messages:
         await store.add_message(
@@ -144,7 +151,9 @@ async def run_decision_cycle(
         )
 
     # Round 4 -- approve (SupervisorAgent, one call for the whole cycle).
-    verdicts, supervisor_usage = await supervisor.review(candidates, messages, sim_time=sim_time, client=client)
+    verdicts, supervisor_usage = await supervisor.review(
+        candidates, messages, sim_time=sim_time, links=neighbor_links, client=client
+    )
     if supervisor_usage is not None:
         await _log_llm_call(
             store, run_id=run_id, sim_time=sim_time, agent_id="supervisor", role="supervisor", usage=supervisor_usage
@@ -199,6 +208,7 @@ async def _run_coalition_round(
     neighbor_map: dict[str, list[str]],
     snapshots: dict[str, JunctionSnapshot],
     tls_states: dict[str, TlsState],
+    neighbor_links: dict[str, dict[str, NeighborLink]],
     *,
     sim_time: float,
     client: AsyncOpenAI | None,
@@ -244,7 +254,14 @@ async def _run_coalition_round(
     ]
     reply_results = await asyncio.gather(
         *(
-            agents[recipient].reply(incoming, snapshots[recipient], tls_states[recipient], sim_time, client=client)
+            agents[recipient].reply(
+                incoming,
+                snapshots[recipient],
+                tls_states[recipient],
+                sim_time,
+                link=neighbor_links.get(recipient, {}).get(incoming.sender),
+                client=client,
+            )
             for recipient, incoming in reply_targets
         )
     )

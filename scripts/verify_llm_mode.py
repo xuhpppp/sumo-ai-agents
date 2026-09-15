@@ -22,12 +22,18 @@ Checks:
       read back correctly (the actual live-enforcement behavior was
       verified separately via a real, non-committed probe -- see
       `_apply_set_green_bounds`'s docstring).
+  1e. `neighbor_links` against the ACTUATED network -- $0, no LLM: confirms
+      every LLM_AGENT_JUNCTIONS key matches `signalized_neighbor_map`'s
+      neighbor set and at least one pair of AGENT junctions is directly
+      linked (STEPS.md Step 14 coordination-context follow-up -- otherwise
+      the supervisor's corridor section would never have real data to show
+      in this run's actual agent set).
   2. Two real decision cycles through `sim.runner`'s actual internal
      functions (not reimplemented here), against the ACTUATED network --
-     confirms `decision_id`/`effect` wiring and the new `set_green_bounds`
-     action space end to end, real API calls included. Real OpenAI calls,
-     small cost (~$0.05-0.15: 12 observe calls + up to a few coalition
-     replies + up to 2 supervisor calls).
+     confirms `decision_id`/`effect` wiring and the `set_green_bounds`
+     action space + corridor-context wiring end to end, real API calls
+     included. Real OpenAI calls, small cost (~$0.05-0.15: 12 observe calls
+     + up to a few coalition replies + up to 2 supervisor calls).
 
 Usage:
     python scripts/verify_llm_mode.py
@@ -43,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sumo_agents.agents.junction import JunctionAgent  # noqa: E402
 from sumo_agents.agents.supervisor import SupervisorAgent  # noqa: E402
-from sumo_agents.agents.topology import signalized_neighbor_map  # noqa: E402
+from sumo_agents.agents.topology import neighbor_links, signalized_neighbor_map  # noqa: E402
 from sumo_agents.obs.db import make_async_engine, make_session_factory  # noqa: E402
 from sumo_agents.obs.store import Store  # noqa: E402
 from sumo_agents.safety.validator import SetCycleLength, SetGreenBounds, SetOffset  # noqa: E402
@@ -127,6 +133,28 @@ def check_phase_lane_groups() -> None:
         conn.close()
 
 
+def check_neighbor_links() -> None:
+    print("--- check 1e: neighbor_links() against the actuated network ($0, no TraCI/LLM) ---")
+    net_file = NETWORKS_DIR / SCENARIO / "net_actuated.xml"
+    link_map = neighbor_links(net_file)
+    neighbor_map = signalized_neighbor_map(net_file)
+    assert link_map.keys() == neighbor_map.keys()
+    for jid in LLM_AGENT_JUNCTIONS:
+        assert set(link_map[jid]) == set(neighbor_map[jid]), jid
+        for link in link_map[jid].values():
+            assert link.distance_m > 0 and link.travel_time_s > 0
+    # LLM_AGENT_JUNCTIONS (B0,B1,B2,C0,C1,C2) is a 2x3 block -- confirm at
+    # least one pair of AGENT junctions (not just agent-to-non-agent) is
+    # directly linked, since that's the pair SupervisorAgent's corridor
+    # section actually needs data for.
+    agent_pairs = [
+        (a, b) for a in LLM_AGENT_JUNCTIONS for b in link_map[a] if b in LLM_AGENT_JUNCTIONS
+    ]
+    print(f"  agent-to-agent links: {sorted(set(agent_pairs))}")
+    assert agent_pairs, "expected at least one directly-connected pair among LLM_AGENT_JUNCTIONS"
+    print("  PASS")
+
+
 def check_apply_set_green_bounds() -> None:
     print("--- check 1d: apply_action(SetGreenBounds) against real TraCI (actuated network) ---")
     conn = SumoConnection(backend=Backend.LIBSUMO)
@@ -153,6 +181,7 @@ async def check_two_real_llm_cycles() -> None:
     print("\n--- check 2: 2 real decision cycles through sim.runner's actual functions (actuated network) ---")
     net_file = NETWORKS_DIR / SCENARIO / "net_actuated.xml"
     neighbor_map = signalized_neighbor_map(net_file)
+    link_map = neighbor_links(net_file)
     agents = {jid: JunctionAgent(jid, neighbor_map[jid]) for jid in LLM_AGENT_JUNCTIONS}
     supervisor = SupervisorAgent()
 
@@ -199,7 +228,7 @@ async def check_two_real_llm_cycles() -> None:
                 decisions = await _run_llm_decision_cycle(
                     agents, neighbor_map, agent_snapshots, agent_tls_states, supervisor,
                     sim_time, cycle_id, run_id, store,
-                    history=agent_history, per_phase=agent_per_phase,
+                    history=agent_history, per_phase=agent_per_phase, neighbor_links=link_map,
                 )
                 for d in decisions:
                     print(
@@ -222,6 +251,7 @@ def main() -> None:
     check_apply_set_offset()
     check_phase_lane_groups()
     check_apply_set_green_bounds()
+    check_neighbor_links()
     asyncio.run(check_two_real_llm_cycles())
 
 

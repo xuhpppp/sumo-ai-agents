@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sumo_agents.agents.llm import Usage
 from sumo_agents.agents.orchestrator import run_decision_cycle
 from sumo_agents.agents.protocol import Message, Proposal, Verdict
+from sumo_agents.agents.topology import NeighborLink
 from sumo_agents.obs.models import Decision
 from sumo_agents.obs.models import Message as MessageRow
 from sumo_agents.obs.store import Store
@@ -52,9 +53,11 @@ class _FakeAgent:
     def __init__(self, junction_id: str) -> None:
         self.junction_id = junction_id
         self.reply_calls: list[Message] = []
+        self.reply_links: list[object] = []
 
-    async def reply(self, incoming, snapshot, tls_state, sim_time, *, client=None):
+    async def reply(self, incoming, snapshot, tls_state, sim_time, *, link=None, client=None):
         self.reply_calls.append(incoming)
+        self.reply_links.append(link)
         reply = Message(
             sender=self.junction_id,
             recipients=[incoming.sender],
@@ -75,7 +78,7 @@ class _FakeSupervisor:
         self.seen_candidates: list[str] = []
         self.seen_messages: list[Message] = []
 
-    async def review(self, candidates, messages, *, sim_time, client=None):
+    async def review(self, candidates, messages, *, sim_time, links=None, client=None):
         self.seen_candidates = [c.junction_id for c in candidates]
         self.seen_messages = list(messages)
         if not candidates:
@@ -111,6 +114,16 @@ def _proposals() -> dict[str, Proposal]:
     }
 
 
+_NEIGHBOR_LINKS = {
+    "J1": {
+        "J2": NeighborLink(neighbor_id="J2", distance_m=179.2, travel_time_s=12.9),
+        "J3": NeighborLink(neighbor_id="J3", distance_m=200.0, travel_time_s=15.0),
+    },
+    "J2": {"J1": NeighborLink(neighbor_id="J1", distance_m=179.2, travel_time_s=12.9)},
+    "J3": {"J1": NeighborLink(neighbor_id="J1", distance_m=200.0, travel_time_s=15.0)},
+}
+
+
 async def _run(store: Store) -> tuple[list, _FakeSupervisor, dict[str, _FakeAgent]]:
     run_id = await store.create_run(scenario="_test", seed=0, mode="llm", config={})
     proposals = _proposals()
@@ -131,6 +144,7 @@ async def _run(store: Store) -> tuple[list, _FakeSupervisor, dict[str, _FakeAgen
         cycle_id=1,
         run_id=run_id,
         store=store,
+        neighbor_links=_NEIGHBOR_LINKS,
     )
     return decisions, supervisor, agents, run_id
 
@@ -171,6 +185,36 @@ async def test_only_congested_junctions_broadcast_to_active_neighbors(store: Sto
     assert agents["J1"].reply_calls[0].sender == "J3"
     assert len(agents["J3"].reply_calls) == 1
     assert agents["J3"].reply_calls[0].sender == "J1"
+
+
+async def test_reply_gets_the_correct_corridor_link_for_its_sender(store: Store) -> None:
+    _decisions, _supervisor, agents, _run_id = await _run(store)
+
+    # J2 replies to J1 -- neighbor_links["J2"]["J1"] must be what it was given.
+    assert agents["J2"].reply_links == [_NEIGHBOR_LINKS["J2"]["J1"]]
+    # J1 replies to J3, J3 replies to J1 -- each gets ITS OWN view of the link
+    # (not the sender's), even though the distance happens to be symmetric here.
+    assert agents["J1"].reply_links == [_NEIGHBOR_LINKS["J1"]["J3"]]
+    assert agents["J3"].reply_links == [_NEIGHBOR_LINKS["J3"]["J1"]]
+
+
+async def test_run_decision_cycle_defaults_to_no_links_when_omitted(store: Store) -> None:
+    # Callers without topology data (or older tests/scripts) must still work
+    # -- link=None everywhere, no crash.
+    run_id = await store.create_run(scenario="_test", seed=0, mode="llm", config={})
+    proposals = _proposals()
+    neighbor_map = {"J1": ["J2", "J3"], "J2": ["J1"], "J3": ["J1"]}
+    snapshots = {jid: _FakeSnapshot() for jid in proposals}
+    tls_states = {jid: TlsState(junction_id=jid, phases=_TLS.phases) for jid in proposals}
+    agents = {jid: _FakeAgent(jid) for jid in proposals}
+    supervisor = _FakeSupervisor()
+
+    await run_decision_cycle(
+        proposals, agents, neighbor_map, snapshots, tls_states, supervisor,
+        sim_time=90.0, cycle_id=1, run_id=run_id, store=store,
+    )
+
+    assert all(link is None for a in agents.values() for link in a.reply_links)
 
 
 async def test_messages_and_decisions_are_persisted(store: Store, session_factory) -> None:

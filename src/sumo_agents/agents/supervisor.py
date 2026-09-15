@@ -31,17 +31,19 @@ from sumo_agents.agents.protocol import (
     Verdict,
     wrap_untrusted_data,
 )
+from sumo_agents.agents.topology import NeighborLink
 from sumo_agents.safety.validator import Action
 
-_CACHE_KEY = "supervisor:v1"
+_CACHE_KEY = "supervisor:v2"
 
 _SYSTEM_PROMPT = f"""\
 You are the traffic-control supervisor for one SUMO-simulated road network. \
 Once per decision cycle, you are given every junction's proposed action for \
 this cycle that has ALREADY passed a deterministic safety validator (hard \
 limits on green/cycle duration, starvation, etc. are already enforced --  \
-you never need to re-check those), plus any coalition messages junctions \
-exchanged with their neighbors this cycle.
+you never need to re-check those), any coalition messages junctions \
+exchanged with their neighbors this cycle, and the real distance/free-flow \
+travel time between any two candidates that are directly connected.
 
 ## Your job
 
@@ -49,11 +51,16 @@ Most of the time, the right answer is to approve everything as-is: \
 independent junctions doing independent, already-validated things is the \
 normal case, not a problem to solve. Only intervene when the proposals, \
 read together, actually conflict or would visibly fight each other -- for \
-example: two adjacent junctions both requesting priority (e.g. via \
-set_offset or a large adjust_phase_split) in opposite traffic directions on \
-the same shared corridor, or a junction's proposal being met with a \
-substantiated `object` message from a neighbor. When you do intervene, \
-prefer `modified` (a smaller/adjusted version of the SAME action type) over \
+example: two adjacent junctions both narrowing the SAME shared corridor's \
+capacity in opposite directions via set_green_bounds (one raising its own \
+phase's floor while its neighbor lowers the ceiling of the phase that feeds \
+that same corridor), or a junction's proposal being met with a \
+substantiated `object` message from a neighbor. Use the corridor \
+distance/travel time to judge urgency: a conflict 10-15s apart can compound \
+within the next cycle or two, while one 60s+ apart usually has time to \
+resolve on its own before it matters -- do not treat every adjacency as \
+equally urgent just because it exists. When you do intervene, prefer \
+`modified` (a smaller/adjusted version of the SAME action type) over \
 `denied` -- only deny when no version of the proposed action is compatible \
 with what a neighbor needs this cycle.
 
@@ -90,7 +97,31 @@ class _SupervisorReview(BaseModel):
     verdicts: list[Verdict]
 
 
-def _build_user_prompt(candidates: list[SupervisorCandidate], messages: list[Message], sim_time: float) -> str:
+def _build_corridor_lines(candidates: list[SupervisorCandidate], links: dict[str, dict[str, NeighborLink]]) -> list[str]:
+    candidate_ids = {c.junction_id for c in candidates}
+    seen_pairs: set[tuple[str, str]] = set()
+    lines = []
+    for jid in candidate_ids:
+        for neighbor_id, link in links.get(jid, {}).items():
+            if neighbor_id not in candidate_ids:
+                continue
+            pair = (jid, neighbor_id) if jid < neighbor_id else (neighbor_id, jid)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            lines.append(
+                f"- {pair[0]} <-> {pair[1]}: distance_m={link.distance_m:.0f} "
+                f"free_flow_travel_time_s={link.travel_time_s:.0f}"
+            )
+    return sorted(lines)
+
+
+def _build_user_prompt(
+    candidates: list[SupervisorCandidate],
+    messages: list[Message],
+    sim_time: float,
+    links: dict[str, dict[str, NeighborLink]] | None = None,
+) -> str:
     lines = [f"sim_time={sim_time:.0f}s", "", "## Validated proposals awaiting your verdict"]
     for c in candidates:
         lines.append(
@@ -107,6 +138,13 @@ def _build_user_prompt(candidates: list[SupervisorCandidate], messages: list[Mes
             lines.append(f"- {m.sender} -> {m.recipients} intent={m.intent} rationale={m.rationale!r}")
     else:
         lines.append("(none -- no junction reported congestion this cycle)")
+    lines.append("")
+    lines.append("## Corridor adjacency between today's candidates")
+    corridor_lines = _build_corridor_lines(candidates, links or {})
+    if corridor_lines:
+        lines.extend(corridor_lines)
+    else:
+        lines.append("(none -- no two candidates this cycle are directly connected)")
     return wrap_untrusted_data("junction_proposals_and_messages", "\n".join(lines))
 
 
@@ -122,6 +160,7 @@ class SupervisorAgent:
         messages: list[Message],
         *,
         sim_time: float,
+        links: dict[str, dict[str, NeighborLink]] | None = None,
         client: AsyncOpenAI | None = None,
     ) -> tuple[dict[str, Verdict], Usage | None]:
         """Rule on every candidate at once. Returns `(verdicts, usage)` --
@@ -133,12 +172,15 @@ class SupervisorAgent:
         failed, or because it referenced an unknown/wrong junction_id) --
         the underlying action already passed the deterministic validator,
         so "approve what we already know is safe" is a safe default, not a
-        silent bypass.
+        silent bypass. `links`: the network's full neighbor-distance map
+        (STEPS.md Step 14 coordination-context follow-up, `agents/
+        topology.neighbor_links`) -- only the pairs where BOTH junctions are
+        candidates this cycle actually get rendered into the prompt.
         """
         if not candidates:
             return {}, None
 
-        user = _build_user_prompt(candidates, messages, sim_time)
+        user = _build_user_prompt(candidates, messages, sim_time, links)
         parsed, usage = await ask(
             "supervisor", self._system, user, _SupervisorReview, cache_key=_CACHE_KEY, client=client
         )

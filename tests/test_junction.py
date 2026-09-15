@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from sumo_agents.agents.junction import JunctionAgent, _build_system_prompt
+from sumo_agents.agents.junction import JunctionAgent, _build_reply_user_prompt, _build_system_prompt
 from sumo_agents.agents.protocol import Message, Proposal
+from sumo_agents.agents.topology import NeighborLink
 from sumo_agents.safety.validator import NoAction, PhaseState, SetGreenBounds, TlsState
 from sumo_agents.sim.state import JunctionSnapshot
 
@@ -231,6 +232,33 @@ async def test_reply_falls_back_to_ack_on_llm_failure() -> None:
     assert usage.status == "error"
 
 
+def test_reply_prompt_includes_corridor_context_when_a_link_is_given() -> None:
+    link = NeighborLink(neighbor_id="A1", distance_m=179.2, travel_time_s=12.9)
+    user = _build_reply_user_prompt(_INCOMING, _SNAPSHOT, _TLS_STATE, sim_time=90.0, link=link)
+
+    assert "corridor_to_sender" in user
+    assert "distance_m=179" in user
+    assert "free_flow_travel_time_s=13" in user
+
+
+def test_reply_prompt_omits_corridor_context_when_no_link_is_given() -> None:
+    user = _build_reply_user_prompt(_INCOMING, _SNAPSHOT, _TLS_STATE, sim_time=90.0)
+
+    assert "corridor_to_sender" not in user
+
+
+async def test_reply_passes_the_link_through_to_the_prompt() -> None:
+    reply = SimpleNamespace(intent="ack", rationale="x")
+    client = _FakeClient(_fake_response(reply))
+    agent = JunctionAgent("B1", ["A1"])
+    link = NeighborLink(neighbor_id="A1", distance_m=179.2, travel_time_s=12.9)
+
+    await agent.reply(_INCOMING, _SNAPSHOT, _TLS_STATE, sim_time=90.0, link=link, client=client)
+
+    (call,) = client.responses.calls
+    assert "corridor_to_sender" in call["input"][1]["content"]
+
+
 async def test_reply_uses_the_same_system_prompt_and_cache_key_as_observe() -> None:
     reply = SimpleNamespace(intent="report", rationale="x")
     client = _FakeClient(_fake_response(reply))
@@ -239,7 +267,7 @@ async def test_reply_uses_the_same_system_prompt_and_cache_key_as_observe() -> N
     await agent.reply(_INCOMING, _SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
 
     (call,) = client.responses.calls
-    assert call["prompt_cache_key"] == "junction:B1:v6"
+    assert call["prompt_cache_key"] == "junction:B1:v7"
     assert call["input"][0]["content"] == agent._system
 
 
@@ -256,7 +284,7 @@ async def test_observe_passes_cache_key_and_schema_through_to_ask() -> None:
     await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
 
     (call,) = client.responses.calls
-    assert call["prompt_cache_key"] == "junction:B1:v6"
+    assert call["prompt_cache_key"] == "junction:B1:v7"
     assert call["text_format"] is Proposal
     assert call["model"] == "gpt-5.6-luna"
     assert call["input"][0]["role"] == "system"

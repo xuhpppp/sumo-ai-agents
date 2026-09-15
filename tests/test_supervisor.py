@@ -12,7 +12,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from sumo_agents.agents.protocol import SetGreenBounds, Verdict
-from sumo_agents.agents.supervisor import SupervisorAgent, SupervisorCandidate
+from sumo_agents.agents.supervisor import SupervisorAgent, SupervisorCandidate, _build_user_prompt
+from sumo_agents.agents.topology import NeighborLink
 from sumo_agents.safety.validator import AdjustPhaseSplit
 
 _CANDIDATE_A = SupervisorCandidate(
@@ -130,6 +131,38 @@ async def test_review_falls_back_to_approved_for_every_candidate_on_llm_failure(
     assert usage.status == "error"
 
 
+def test_corridor_section_shows_the_link_between_two_candidates() -> None:
+    links = {"B1": {"C1": NeighborLink(neighbor_id="C1", distance_m=179.2, travel_time_s=12.9)}}
+
+    user = _build_user_prompt([_CANDIDATE_A, _CANDIDATE_B], [], sim_time=90.0, links=links)
+
+    assert "B1 <-> C1" in user
+    assert "distance_m=179" in user
+    assert "free_flow_travel_time_s=13" in user
+
+
+def test_corridor_section_omits_a_link_to_a_non_candidate_junction() -> None:
+    # D1 isn't a candidate this cycle -- its link to B1 must not be rendered
+    # even though `links` carries it (real neighbor_links() includes every
+    # neighbor, not just today's congested ones).
+    links = {
+        "B1": {
+            "C1": NeighborLink(neighbor_id="C1", distance_m=179.2, travel_time_s=12.9),
+            "D1": NeighborLink(neighbor_id="D1", distance_m=200.0, travel_time_s=15.0),
+        }
+    }
+
+    user = _build_user_prompt([_CANDIDATE_A, _CANDIDATE_B], [], sim_time=90.0, links=links)
+
+    assert "D1" not in user
+
+
+def test_corridor_section_says_so_explicitly_when_no_candidates_are_linked() -> None:
+    user = _build_user_prompt([_CANDIDATE_A, _CANDIDATE_B], [], sim_time=90.0, links={})
+
+    assert "none -- no two candidates" in user
+
+
 async def test_review_passes_cache_key_and_schema_through_to_ask() -> None:
     reply = [Verdict(junction_id="B1", decision="approved", reason="OK.")]
     client = _FakeClient(_fake_response(reply))
@@ -138,6 +171,21 @@ async def test_review_passes_cache_key_and_schema_through_to_ask() -> None:
     await supervisor.review([_CANDIDATE_A], [], sim_time=90.0, client=client)
 
     (call,) = client.responses.calls
-    assert call["prompt_cache_key"] == "supervisor:v1"
+    assert call["prompt_cache_key"] == "supervisor:v2"
     assert call["model"] == "gpt-5.6-terra"
     assert call["reasoning"] == {"effort": "medium"}
+
+
+async def test_review_passes_links_through_to_the_prompt() -> None:
+    reply = [
+        Verdict(junction_id="B1", decision="approved", reason="OK."),
+        Verdict(junction_id="C1", decision="approved", reason="OK."),
+    ]
+    client = _FakeClient(_fake_response(reply))
+    supervisor = SupervisorAgent()
+    links = {"B1": {"C1": NeighborLink(neighbor_id="C1", distance_m=179.2, travel_time_s=12.9)}}
+
+    await supervisor.review([_CANDIDATE_A, _CANDIDATE_B], [], sim_time=90.0, links=links, client=client)
+
+    (call,) = client.responses.calls
+    assert "B1 <-> C1" in call["input"][1]["content"]

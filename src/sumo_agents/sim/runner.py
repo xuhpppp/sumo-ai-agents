@@ -38,7 +38,7 @@ from sumo_agents.agents.junction import JunctionAgent
 from sumo_agents.agents.orchestrator import CycleDecision, run_decision_cycle
 from sumo_agents.agents.protocol import Proposal
 from sumo_agents.agents.supervisor import SupervisorAgent
-from sumo_agents.agents.topology import signalized_neighbor_map
+from sumo_agents.agents.topology import NeighborLink, neighbor_links, signalized_neighbor_map
 from sumo_agents.baselines.actuated import ActuatedController
 from sumo_agents.baselines.base import Controller
 from sumo_agents.baselines.fixed import FixedController
@@ -126,6 +126,7 @@ async def _run_llm_decision_cycle(
     store: Store,
     history: dict[str, list[JunctionSnapshot]] | None = None,
     per_phase: dict[str, dict[str, dict[str, float | int]]] | None = None,
+    neighbor_links: dict[str, dict[str, NeighborLink]] | None = None,
 ) -> list[CycleDecision]:
     """Round 1 (observe, parallel -- STEPS.md Step 12) + rounds 2-4
     (agents/orchestrator.py, Step 13), together as ONE background task --
@@ -133,7 +134,9 @@ async def _run_llm_decision_cycle(
     `history`: each junction's own snapshots from its last few decision
     cycles (STEPS.md Step 14 follow-up -- see `JunctionAgent.observe`).
     `per_phase`: each junction's queue/wait broken down by green phase_id
-    (STEPS.md Step 14 follow-up #2)."""
+    (STEPS.md Step 14 follow-up #2). `neighbor_links`: real distance/
+    travel-time between adjacent junctions (STEPS.md Step 14
+    coordination-context follow-up)."""
     history = history or {}
     per_phase = per_phase or {}
     observe_results = await asyncio.gather(
@@ -175,6 +178,7 @@ async def _run_llm_decision_cycle(
         cycle_id=cycle_id,
         run_id=run_id,
         store=store,
+        neighbor_links=neighbor_links,
     )
 
 
@@ -250,6 +254,7 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
         # everything except the decision block itself is shared.
         llm_agents: dict[str, JunctionAgent] = {}
         llm_neighbor_map: dict[str, list[str]] = {}
+        llm_neighbor_links: dict[str, dict[str, NeighborLink]] = {}
         supervisor: SupervisorAgent | None = None
         pending_task: asyncio.Task[list[CycleDecision]] | None = None
         pending_task_snapshots: dict[str, JunctionSnapshot] = {}
@@ -290,6 +295,7 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
                 # changed tls.default-type) -- read from the actuated file
                 # for consistency with what `conn` actually has loaded.
                 llm_neighbor_map = signalized_neighbor_map(scenario_dir / "net_actuated.xml")
+                llm_neighbor_links = neighbor_links(scenario_dir / "net_actuated.xml")
                 llm_agents = {jid: JunctionAgent(jid, llm_neighbor_map[jid]) for jid in LLM_AGENT_JUNCTIONS}
                 supervisor = SupervisorAgent()
                 controller_observe = None
@@ -407,6 +413,7 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
                                         store,
                                         history=agent_history,
                                         per_phase=agent_per_phase,
+                                        neighbor_links=llm_neighbor_links,
                                     )
                                 )
                                 pending_task_snapshots = agent_snapshots

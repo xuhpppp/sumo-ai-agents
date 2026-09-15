@@ -34,6 +34,7 @@ from sumo_agents.agents.protocol import (
     Proposal,
     wrap_untrusted_data,
 )
+from sumo_agents.agents.topology import NeighborLink
 from sumo_agents.safety.validator import HARD_CONSTRAINTS, NoAction, TlsState
 from sumo_agents.sim.state import JunctionSnapshot
 
@@ -137,7 +138,11 @@ rationale). A neighbor may then send YOU a message about it -- `report` \
 believe you are contributing to their congestion), `propose` (a \
 coordinated change, e.g. to your offsets), `ack` (agreeing), or `object` \
 (disagreeing, e.g. because they need priority in the opposite direction \
-right now). When you are asked to reply to such a message, address it with \
+right now). When you are asked to reply to such a message, you will also \
+be told the real distance and free-flow travel time along the road \
+connecting you to the sender -- use it to judge how soon their situation \
+could actually reach you (a change 12s away is a near-term concern; one \
+80s away has time to resolve itself before it matters). Address it with \
 one of these same 5 intents and a short rationale -- your reply is one of \
 the inputs `SupervisorAgent` uses to resolve conflicts between junctions \
 before anything is actually applied, so an `object` you have good reason \
@@ -245,12 +250,23 @@ def _build_user_prompt(
 
 
 def _build_reply_user_prompt(
-    incoming: Message, snapshot: JunctionSnapshot, tls_state: TlsState, sim_time: float
+    incoming: Message,
+    snapshot: JunctionSnapshot,
+    tls_state: TlsState,
+    sim_time: float,
+    link: NeighborLink | None = None,
 ) -> str:
     own_state = _build_own_state_text(snapshot, tls_state, sim_time)
+    if link is not None:
+        corridor = (
+            f"corridor_to_sender: distance_m={link.distance_m:.0f} "
+            f"free_flow_travel_time_s={link.travel_time_s:.0f}\n"
+        )
+    else:
+        corridor = ""
     wrapped = wrap_untrusted_data(f"coalition_message_from_{incoming.sender}", incoming.model_dump_json())
     return (
-        f"{own_state}\n"
+        f"{own_state}{corridor}\n"
         "A neighboring junction sent you the coalition message below this "
         f"cycle. Reply to it (sender={incoming.sender}):\n{wrapped}"
     )
@@ -281,10 +297,14 @@ class JunctionAgent:
         # after 3 real full-hour runs found periodic retiming structurally
         # capped well below `actuated`'s result; junction now runs on SUMO's
         # own actuated engine, agent sets its strategic min/max bounds.
+        # v7: Step 14 coordination-context follow-up -- coalition-round
+        # section now mentions the real distance/travel-time a `reply()`
+        # call is given for the sender, so the model can weigh how soon a
+        # neighbor's situation could actually reach it.
         # Bump the version whenever the system prompt text itself changes
         # (agents/llm.py's docstring), since a stale cache_key would just
         # miss the cache, not error.
-        self._cache_key = f"junction:{junction_id}:v6"
+        self._cache_key = f"junction:{junction_id}:v7"
 
     async def observe(
         self,
@@ -339,6 +359,7 @@ class JunctionAgent:
         tls_state: TlsState,
         sim_time: float,
         *,
+        link: NeighborLink | None = None,
         client: AsyncOpenAI | None = None,
     ) -> tuple[Message, Usage]:
         """Round 2 (coalition): respond to one incoming message from a
@@ -346,12 +367,16 @@ class JunctionAgent:
         "sim never waits for LLM" fallback as `observe()`, here defaulting
         to a neutral `ack` rather than staying silent, since the orchestrator
         (Step 13) expects one reply per incoming message it dispatched.
+        `link`: the real distance/travel-time to `incoming.sender` (STEPS.md
+        Step 14 coordination-context follow-up) -- `None` when the caller
+        doesn't have topology data (e.g. a synthetic test), in which case
+        the prompt simply omits that line.
 
         The model only decides `intent`/`rationale` (see
         `_CoalitionReplyDecision` above) -- `sender`/`recipients` are set
         here, deterministically, not parsed from the model's output, so
         there is nothing to defensively normalize (unlike `observe()`)."""
-        user = _build_reply_user_prompt(incoming, snapshot, tls_state, sim_time)
+        user = _build_reply_user_prompt(incoming, snapshot, tls_state, sim_time, link)
         parsed, usage = await ask(
             "junction", self._system, user, _CoalitionReplyDecision, cache_key=self._cache_key, client=client
         )

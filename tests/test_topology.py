@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sumo_agents.agents.topology import signalized_neighbor_map
+import pytest
+
+from sumo_agents.agents.topology import neighbor_links, signalized_neighbor_map
 
 NET_FILE = Path(__file__).resolve().parents[1] / "networks" / "grid_4x4" / "net.xml"
 
@@ -50,3 +52,32 @@ def test_neighbor_relationship_is_symmetric() -> None:
     for junction_id, neighbors in neighbor_map.items():
         for neighbor_id in neighbors:
             assert junction_id in neighbor_map[neighbor_id]
+
+
+def test_neighbor_links_keys_match_signalized_neighbor_map() -> None:
+    links = neighbor_links(NET_FILE)
+    neighbor_map = signalized_neighbor_map(NET_FILE)
+    assert links.keys() == neighbor_map.keys()
+    for junction_id, neighbors in neighbor_map.items():
+        assert set(links[junction_id]) == set(neighbors)
+
+
+def test_neighbor_links_match_known_grid_block_length() -> None:
+    # Cross-checked directly against net.xml: grid_4x4 is a uniform grid,
+    # every block edge is 179.2m at the network's 13.89 m/s (50 km/h) speed
+    # limit -- so every direct link should report the same distance/time.
+    links = neighbor_links(NET_FILE)
+    link = links["B1"]["A1"]
+    assert link.neighbor_id == "A1"
+    assert link.distance_m == pytest.approx(179.2)
+    assert link.travel_time_s == pytest.approx(179.2 / 13.89, rel=1e-3)
+
+
+def test_neighbor_links_are_symmetric_and_positive() -> None:
+    links = neighbor_links(NET_FILE)
+    for junction_id, neighbors in links.items():
+        for neighbor_id, link in neighbors.items():
+            assert link.distance_m > 0
+            assert link.travel_time_s > 0
+            back = links[neighbor_id][junction_id]
+            assert back.distance_m == pytest.approx(link.distance_m)
