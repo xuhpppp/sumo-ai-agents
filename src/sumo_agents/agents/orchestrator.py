@@ -44,9 +44,14 @@ _COALITION_ROUND = 2
 class CycleDecision:
     """One junction's outcome for one decision cycle -- mirrors one row of
     the `decisions` table (obs/models.py), plus `final_action`: what Step 14
-    should actually push to TraCI (`None` if rejected or denied)."""
+    should actually push to TraCI (`None` if rejected or denied). `decision_id`
+    is that row's primary key -- `run_decision_cycle` never touches TraCI
+    itself (only the sim loop does, plan section 3.1), so the caller needs
+    this id to patch `applied`/`effect` back onto the same row later, via
+    `Store.update_decision`."""
 
     junction_id: str
+    decision_id: int
     proposed_action: Action
     validator_status: str  # ok | clamped | rejected
     validator_violations: list[str]
@@ -102,9 +107,21 @@ async def run_decision_cycle(
     for jid, proposal in proposals.items():
         result = validate(proposal.action, tls_states[jid])
         if not result.ok:
+            decision_id = await store.add_decision(
+                run_id=run_id,
+                sim_time=sim_time,
+                cycle_id=cycle_id,
+                junction_id=jid,
+                action_type=proposal.action.type,
+                params=proposal.action.model_dump(exclude={"type", "junction_id"}),
+                validator_status="rejected",
+                validator_violations={"violations": result.violations} if result.violations else None,
+                applied=False,
+            )
             decisions.append(
                 CycleDecision(
                     junction_id=jid,
+                    decision_id=decision_id,
                     proposed_action=proposal.action,
                     validator_status="rejected",
                     validator_violations=result.violations,
@@ -146,31 +163,31 @@ async def run_decision_cycle(
             final_action = verdict.modified_action.model_copy(update={"junction_id": jid})  # type: ignore[union-attr]
         # decision == "denied" -> final_action stays None.
 
+        validator_status = "clamped" if violations else "ok"
+        decision_id = await store.add_decision(
+            run_id=run_id,
+            sim_time=sim_time,
+            cycle_id=cycle_id,
+            junction_id=jid,
+            action_type=proposal.action.type,
+            params=proposal.action.model_dump(exclude={"type", "junction_id"}),
+            validator_status=validator_status,
+            validator_violations={"violations": violations} if violations else None,
+            supervisor_verdict=verdict.decision,
+            supervisor_reason=verdict.reason,
+            applied=False,  # the sim loop (Step 14) sets this once actually pushed via TraCI
+        )
         decisions.append(
             CycleDecision(
                 junction_id=jid,
+                decision_id=decision_id,
                 proposed_action=proposal.action,
-                validator_status="clamped" if violations else "ok",
+                validator_status=validator_status,
                 validator_violations=violations,
                 supervisor_verdict=verdict.decision,
                 supervisor_reason=verdict.reason,
                 final_action=final_action,
             )
-        )
-
-    for d in decisions:
-        await store.add_decision(
-            run_id=run_id,
-            sim_time=sim_time,
-            cycle_id=cycle_id,
-            junction_id=d.junction_id,
-            action_type=d.proposed_action.type,
-            params=d.proposed_action.model_dump(exclude={"type", "junction_id"}),
-            validator_status=d.validator_status,
-            validator_violations={"violations": d.validator_violations} if d.validator_violations else None,
-            supervisor_verdict=d.supervisor_verdict,
-            supervisor_reason=d.supervisor_reason,
-            applied=False,  # Step 14 sets this once the action is actually pushed via TraCI
         )
 
     return decisions

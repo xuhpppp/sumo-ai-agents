@@ -113,6 +113,43 @@ async def test_observe_normalizes_a_junction_id_mismatch() -> None:
     assert proposal.action.junction_id == "B1"
 
 
+async def test_observe_with_no_history_says_so_explicitly() -> None:
+    # STEPS.md Step 14 follow-up: a real full-hour run found the model
+    # treating "only one cycle of data" as a reason to never act, even
+    # through real congestion. The first cycle of a run has no history --
+    # the prompt must say that plainly rather than silently omitting the
+    # section (an omission reads as "no data provided" more than "n/a").
+    reply = Proposal(junction_id="B1", action=NoAction(junction_id="B1"), urgency="low", rationale="x")
+    client = _FakeClient(_fake_response(reply))
+    agent = JunctionAgent("B1", ["A1"])
+
+    await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
+
+    user_prompt = client.responses.calls[0]["input"][1]["content"]
+    assert "trend_last_cycles: (none" in user_prompt
+
+
+async def test_observe_passes_trend_history_into_the_user_prompt() -> None:
+    reply = Proposal(junction_id="B1", action=NoAction(junction_id="B1"), urgency="low", rationale="x")
+    client = _FakeClient(_fake_response(reply))
+    agent = JunctionAgent("B1", ["A1"])
+    history = [
+        JunctionSnapshot(
+            junction_id="B1", current_phase=0, queue_len=12, mean_waiting_s=20.1, throughput=10, mean_speed=8.2, co2_mg=1.0
+        ),
+        JunctionSnapshot(
+            junction_id="B1", current_phase=0, queue_len=28, mean_waiting_s=55.3, throughput=8, mean_speed=3.1, co2_mg=1.0
+        ),
+    ]
+
+    await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=180.0, history=history, client=client)
+
+    user_prompt = client.responses.calls[0]["input"][1]["content"]
+    assert "trend_last_2_cycles" in user_prompt
+    assert "queue_len=[12, 28]" in user_prompt
+    assert "mean_waiting_s=[20.1, 55.3]" in user_prompt
+
+
 async def test_observe_falls_back_to_no_action_on_llm_failure() -> None:
     client = _FakeClient(RuntimeError("boom"))
     agent = JunctionAgent("B1", ["A1"])
@@ -172,7 +209,7 @@ async def test_reply_uses_the_same_system_prompt_and_cache_key_as_observe() -> N
     await agent.reply(_INCOMING, _SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
 
     (call,) = client.responses.calls
-    assert call["prompt_cache_key"] == "junction:B1:v3"
+    assert call["prompt_cache_key"] == "junction:B1:v4"
     assert call["input"][0]["content"] == agent._system
 
 
@@ -189,7 +226,7 @@ async def test_observe_passes_cache_key_and_schema_through_to_ask() -> None:
     await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
 
     (call,) = client.responses.calls
-    assert call["prompt_cache_key"] == "junction:B1:v3"
+    assert call["prompt_cache_key"] == "junction:B1:v4"
     assert call["text_format"] is Proposal
     assert call["model"] == "gpt-5.6-luna"
     assert call["input"][0]["role"] == "system"

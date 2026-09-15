@@ -15,6 +15,8 @@ from sumo_agents.safety.validator import (
     NoAction,
     PhaseKind,
     PhaseState,
+    SetCycleLength,
+    SetOffset,
     TlsState,
 )
 from sumo_agents.sim.conn import SumoConnection
@@ -68,16 +70,24 @@ def read_tls_state(
 def apply_action(conn: SumoConnection, action: Action) -> None:
     """Apply an already-validated action via TraCI.
 
-    Only the action types Step 8's baselines actually emit are implemented;
-    the rest raise NotImplementedError until Phase 2 needs them (JunctionAgent
-    gets the full action space, STEPS.md Step 12+).
+    `request_vms` is the one action type still not implemented here --
+    it needs real rerouting/VMS device infrastructure that doesn't exist
+    yet, and is explicitly its own later step (STEPS.md Step 19: "VMS /
+    rerouting + compliance rate"). Every other action type (STEPS.md Step
+    14 -- JunctionAgent's full action space is now live) is implemented.
     """
     if isinstance(action, NoAction):
         return
     if isinstance(action, AdjustPhaseSplit):
         _apply_adjust_phase_split(conn, action)
         return
-    raise NotImplementedError(f"apply_action: {type(action).__name__} not implemented yet (Phase 2)")
+    if isinstance(action, SetCycleLength):
+        _apply_set_cycle_length(conn, action)
+        return
+    if isinstance(action, SetOffset):
+        _apply_set_offset(conn, action)
+        return
+    raise NotImplementedError(f"apply_action: {type(action).__name__} not implemented yet (STEPS.md Step 19)")
 
 
 def _apply_adjust_phase_split(conn: SumoConnection, action: AdjustPhaseSplit) -> None:
@@ -99,3 +109,47 @@ def _apply_adjust_phase_split(conn: SumoConnection, action: AdjustPhaseSplit) ->
         action.junction_id,
         Logic(logic.programID, logic.type, logic.currentPhaseIndex, phases, logic.subParameter),
     )
+
+
+def _apply_set_cycle_length(conn: SumoConnection, action: SetCycleLength) -> None:
+    """Rescale every GREEN phase's duration so the whole cycle hits
+    `action.cycle_s`, keeping yellow/all-red phases fixed (same constraint
+    `adjust_phase_split` respects) and the current 2-green-phase SPLIT
+    proportionally unchanged -- this changes total capacity without
+    silently re-deciding which direction gets more of it."""
+    Phase = conn.trafficlight.Phase
+    Logic = conn.trafficlight.Logic
+    logic = conn.trafficlight.getAllProgramLogics(action.junction_id)[0]
+    phases = list(logic.phases)
+
+    green_indices = [i for i, p in enumerate(phases) if phase_kind(p.state) == "green"]
+    fixed_total = sum(p.duration for i, p in enumerate(phases) if i not in green_indices)
+    green_total_current = sum(phases[i].duration for i in green_indices)
+    green_total_target = action.cycle_s - fixed_total
+    if not green_indices or green_total_current <= 0 or green_total_target <= 0:
+        return  # nothing sane to redistribute onto -- leave the program untouched
+
+    scale = green_total_target / green_total_current
+    for i in green_indices:
+        old = phases[i]
+        phases[i] = Phase(old.duration * scale, old.state, old.minDur, old.maxDur, old.next, old.name)
+
+    conn.trafficlight.setProgramLogic(
+        action.junction_id,
+        Logic(logic.programID, logic.type, logic.currentPhaseIndex, phases, logic.subParameter),
+    )
+
+
+def _apply_set_offset(conn: SumoConnection, action: SetOffset) -> None:
+    """Nudge this junction's cycle to help resynchronize with a neighbor.
+
+    Simplification, documented honestly (plan section 7's "báo cáo trung
+    thực cả chỗ thua"): SUMO's static TLS programs don't expose a
+    persistent "offset" parameter over TraCI, only the remaining duration
+    of whichever phase is CURRENTLY active (`setPhaseDuration`). This
+    applies `offset_s` as a ONE-TIME nudge to that remaining duration
+    rather than a lasting structural offset -- a real coordinated-signal
+    system would rebuild the whole program with a phase shift, which is
+    out of scope for this POC.
+    """
+    conn.trafficlight.setPhaseDuration(action.junction_id, action.offset_s)

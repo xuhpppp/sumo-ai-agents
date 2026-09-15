@@ -27,7 +27,7 @@
 | 11 | `protocol.py` — schema Pydantic | 2 | 2h | ✅ |
 | 12 | `JunctionAgent` (vòng 1: observe) | 2 | 4h | ✅ |
 | 13 | Coalition + `SupervisorAgent` (vòng 2–4) | 2 | 5h | ✅ |
-| 14 | Nối vào SimRunner, chạy full 1h | 2 | 3h | ⬜ |
+| 14 | Nối vào SimRunner, chạy full 1h | 2 | 3h | ✅ |
 | 15 | Backend dashboard + WebSocket | 3 | 3h | ⬜ |
 | 16 | 4 panel frontend | 3 | 5h | ⬜ |
 | 17 | Chế độ `--replay` | 3 | 2h | ⬜ |
@@ -459,17 +459,68 @@ Kết quả (grid_4x4, 3 seed):
 
 ---
 
-## Bước 14 · Nối vào SimRunner, chạy full 1 giờ
+## Bước 14 · Nối vào SimRunner, chạy full 1 giờ ✅
 
 **Mục tiêu**: chế độ `llm` chạy trọn vẹn.
 
-- Cắm `orchestrator` vào `SimRunner` theo §3.2 — **async, sim không chờ**
-- Xử lý `skipped_cycle` khi chu kỳ trước chưa xong
-- Điền `decisions.effect` ở chu kỳ kế (metric trước/sau)
+**Đã làm** (`src/sumo_agents/sim/runner.py`, mode `"llm"`):
+- Round 1 (observe, Bước 12) chạy **song song** (`asyncio.gather`) rồi rounds 2-4 (`agents/orchestrator.py`, Bước 13) — gộp thành **một** background task/chu kỳ (`_run_llm_decision_cycle`), đúng mẫu `asyncio.create_task(...)` không `await` trong plan §3.2. Chu kỳ trước chưa xong khi tới chu kỳ sau → **bỏ qua**, đếm vào `runs.summary.n_skipped_cycles` (không có bảng riêng, tái dùng `Run.summary` JSON đã có — không cần migration).
+- `sim/actuators.py`: thêm `_apply_set_cycle_length` (co giãn tỉ lệ các pha xanh, giữ vàng/đỏ-toàn-phần cố định) và `_apply_set_offset` (đơn giản hoá trung thực: `setPhaseDuration` — một lần nhún thời lượng pha hiện tại, **không phải** offset cấu trúc bền vững vì SUMO static program không có tham số offset qua TraCI — đã ghi chú rõ trong code, đúng tinh thần "báo cáo trung thực" của plan §7). `request_vms` vẫn `NotImplementedError` có chủ đích — đúng phạm vi Bước 19, được `_apply_llm_decisions` bắt riêng, ghi `applied=false` + `effect` giải thích thay vì crash.
+- Theo dõi `time_since_last_green_s` thật (mỗi 10s, chỉ đọc TraCI, không tốn LLM) cho 6 nút agent — trước đó (Bước 8/12) validator luôn coi mọi pha là "vừa xanh xong" vì thiếu lịch sử; đúng như actuators.py đã ghi chú từ Bước 8 rằng việc này "đến cùng Phase 2".
+- `decisions.effect` điền ở **chu kỳ kế**: khi áp dụng `final_action`, nhớ `(decision_id, metric lúc quyết định)`; đầu chu kỳ sau, so với metric mới → `store.update_decision(decision_id, effect={"before":..., "after":...})`. Cần thêm `Store.add_decision` trả về `id` (trước đây `None`) và `Store.update_decision(id, **fields)` mới.
+- Cuối run: `runs.summary` có thêm `total_llm_cost_usd`, `n_llm_calls`, `n_skipped_cycles` — trực tiếp phục vụ yêu cầu DoD "chi phí thực tế được ghi lại".
+- `scripts/compare.py` (Bước 9) **không cần sửa** — đã tổng quát theo `--modes` dạng chuỗi từ đầu, tự động nhận `llm` một khi `sim/runner.py` hỗ trợ.
 
-**DoD**: chạy hết 3600s không crash · thêm cột `llm` vào bảng so sánh Bước 9 · chi phí thực tế/run được ghi lại và đối chiếu với ước tính ~$2
+**⚠️ Phát hiện quan trọng qua đo đạc thực tế (không phải lỗi code, mà là một khoảng trống kiến trúc)**: đo baseline `fixed` chạy hết 3600s+ mô phỏng chỉ tốn **3.4 giây thực** (libsumo ~1100x thời gian thực). Một chu kỳ quyết định LLM thật tốn 10-20 giây thực. Nếu không ghìm lại, hầu hết 40 chu kỳ trong 1 giờ mô phỏng sẽ luôn thấy "chu kỳ trước chưa xong" (vì chỉ ~80ms thực trôi qua giữa 2 điểm quyết định 90s mô phỏng) → **gần như toàn bộ bị skip**, chỉ ~1 chu kỳ thực sự chạy, chi phí thực tế sẽ chỉ vài cent thay vì khớp ước tính ~$2 của plan. Đã thêm cơ chế ghìm tốc độ **chỉ cho mode `llm`**: `LLM_REALTIME_SPEEDUP = 5.0` (mô phỏng nhanh gấp 5 lần thời gian thực thay vì ~1100 lần) — đủ chậm để một chu kỳ (90s mô phỏng ≈ 18s thực) thường kịp xong trước chu kỳ sau, đủ nhanh để không thực sự mất 1 giờ đồng hồ. Baseline modes không bị ảnh hưởng (không ghìm).
 
-> Nhắc lại từ plan §7: `llm` **có thể thua** `actuated`. Đó không phải thất bại — ghi nhận trung thực rồi chuyển sang thiết kế kịch bản làm nổi bật thứ mà baseline không làm được (sự cố bất thường, phối hợp liên nút có giải thích).
+**Kiểm chứng ngắn trước khi chạy full** (`scripts/verify_llm_mode.py` + chạy thật `--mode llm` trong 90s rồi dừng):
+- Check 1 (không tốn LLM): `apply_action(SetCycleLength)` trên TraCI thật — chu kỳ 90s → 60s đúng như yêu cầu, pha vàng/đỏ không đổi. `apply_action(SetOffset)` không lỗi.
+- Check 2 (LLM thật, ~$0.015): 2 chu kỳ qua đúng hàm sản xuất (`_run_llm_decision_cycle`/`_apply_llm_decisions`) — `decision_id` có giá trị, `effect` điền đúng ở chu kỳ 2 cho quyết định từ chu kỳ 1, không crash.
+- Chạy thật 90 giây rồi dừng: **5 chu kỳ chạy trọn vẹn, 0 chu kỳ bị skip** (đúng như tính toán `LLM_REALTIME_SPEEDUP=5.0`), 35 lệnh gọi LLM, $0.036 — đúng cadence ~18s thực/chu kỳ.
+
+**Kết quả full run thật** (`run_id=561c302f-2e73-4b00-995e-a41efff131af`, `grid_4x4`, seed 42, chạy 2026-09-15):
+- Hoàn tất sạch: 42 chu kỳ, tới sim_time=3781s (>3600s như kỳ vọng), **0 chu kỳ bị skip**, **0/301 lệnh LLM lỗi**, 258/258 quyết định `validator_status='ok'` + `applied=true` (không có quyết định nào bị clamp/reject/deny).
+- Chi phí thật: **$0.314824** cho 301 lệnh gọi LLM (258 junction — đúng 6 nút × 43 chu kỳ round 1, 43 supervisor — 1/chu kỳ) — thấp hơn nhiều ước tính ~$2 của plan.
+- `n_completed_trips=4500`, `mean_travel_time_s=134.35`.
+
+**⚠️ Phát hiện trung thực quan trọng (theo đúng tinh thần "báo cáo trung thực cả chỗ thua" của plan §7)**: cả 258 quyết định trong suốt 1 giờ đều là `no_action` — **0 tin nhắn coalition** (round 2 không bao giờ kích hoạt, vì nó chỉ chạy khi có junction đề xuất khác `no_action`). Đối chiếu `metrics` trong đúng cửa sổ sự cố (`incidents.yaml`: `B1B2`/`B2B1`, 1200-1800s, `speed_factor=0.005`) cho thấy sự cố **có** gây tắc thật ở B1/B2 (queue_len lên tới 51, `mean_waiting_s` lên tới ~160s quanh sim_time≈1480-1530s) — tức là JunctionAgent có đủ dữ liệu để thấy tắc nghẽn rõ ràng nhưng vẫn luôn chọn không hành động. Hệ quả: `mean_travel_time_s` của `llm` (134.35555...) khớp **chính xác từng chữ số** với baseline `fixed` (134.34555555555556) — hai run cho kết quả giống hệt nhau vì `llm` trên thực tế không hề thay đổi gì so với chương trình đèn tĩnh mặc định. So với `actuated` (107.40s, tốt hơn hẳn) và `maxpressure` (139.51s), `llm` chỉ ngang `fixed`.
+  - Khả năng nguyên nhân (chưa kết luận, cần Bước 16/tinh chỉnh prompt mới rõ): mỗi lệnh gọi `observe()` chỉ thấy **snapshot hiện tại**, không có lịch sử/xu hướng qua các chu kỳ trước — trong khi system prompt lại yêu cầu rõ "chỉ đề xuất khi có mẫu hình rõ ràng **và bền vững** (persistent), một lần đọc nhiễu là chưa đủ". Không có tín hiệu "đã thấy queue cao 2-3 chu kỳ liên tiếp" trong user prompt, model có thể luôn kết luận "chưa đủ bằng chứng bền vững" → không bao giờ vượt ngưỡng để hành động.
+  - Đây là quan sát hành vi cần cân nhắc (có thể là việc của Bước 16 khi có dashboard để debug trực quan, hoặc một vòng tinh chỉnh prompt riêng) — **không** sửa trong phạm vi Bước 14.
+
+**Follow-up đã sửa ngay sau khi phát hiện (cùng ngày, theo yêu cầu người dùng)**: thêm lịch sử ngắn hạn (`history`, tối đa 3 chu kỳ điều khiển gần nhất, cũ→mới, KHÔNG gồm chu kỳ hiện tại) vào user prompt của `JunctionAgent.observe()` — `sim/runner.py` nuôi buffer `snapshot_history` mỗi khi tạo `pending_task` mới, `agents/junction.py` thêm `_build_trend_text()` + tham số `history` cho `observe()`, cache_key bump `v3`→`v4` (system prompt đổi nội dung mô tả). Chỉ gap (1); gap (2) — phân rã theo hướng/pha — vẫn để sau.
+- **Kiểm chứng lại bằng đúng dữ liệu thật đã gây ra vấn đề**: lấy lại chính xác trạng thái B1 tại sim_time=1301/1391/1481s từ run thật (`queue_len` 33→40→51, `mean_waiting_s` 22.9→79.4→96.1s), gọi `observe()` mới với `history` 2 điểm đầu. Kết quả: model **đổi từ `no_action` sang `adjust_phase_split(phase_id=0, delta_s=8.0)`**, rationale trích dẫn đúng xu hướng 3 số: *"Ùn tắc đang tăng rõ qua các chu kỳ: queue_len 33→40→51, thời gian chờ 22,9→79,4→96,1 giây... chọn mức vừa phải vì chưa có dữ liệu phân tách theo hướng"* — tự nhận đúng luôn giới hạn của gap (2) còn lại. 2 test mới trong `tests/test_junction.py` (không có lịch sử → ghi rõ "chưa có", có lịch sử → prompt chứa đúng số liệu). 95/95 test pass.
+- Run full 1 giờ ngày 2026-09-15 (`561c302f-...`) giờ đã **lỗi thời** cho việc đánh giá hành vi phối hợp (chạy trước khi có fix) — số liệu chi phí/độ ổn định của nó vẫn đúng và giữ nguyên trong bảng trên, nhưng nếu muốn xem `llm` thật sự hành động trong cửa sổ sự cố cần chạy lại full 1 giờ một lần nữa.
+
+**Run full 1 giờ SAU khi có fix trend history** (`run_id=81760b55-7d0c-4b17-8c36-fd891b398737`, `grid_4x4`, seed 42, chạy 2026-09-15 — thay thế các nhận định phía trên về hành vi):
+- Hoàn tất sạch: 43 chu kỳ, **0 chu kỳ skip**, **0/329 lệnh LLM lỗi**, 258/258 quyết định `validator_status='ok'` + `applied=true`. Chi phí **$0.382745** (vẫn thấp hơn nhiều ước tính ~$2 của plan).
+- **Agent giờ thực sự hành động**: 11/258 quyết định khác `no_action` (8 `adjust_phase_split`, 3 `set_cycle_length`), tất cả đều được supervisor `approved`; **39 tin nhắn coalition round** (round 2 lần đầu tiên thực sự kích hoạt trong một full run thật — trước fix con số này luôn là 0). Phần lớn hành động rơi đúng vào/quanh cửa sổ sự cố 1200-1800s (`B0`/`B1`/`B2` tại sim_time 1351/1441/1531/1711s) — đúng nơi có tắc nghẽn thật, xác nhận fix hoạt động đúng ở quy mô cả run, không chỉ ở phép thử tái hiện thủ công.
+- **Kết quả trung thực (đúng tinh thần plan §7 "llm có thể thua actuated")**: `mean_travel_time_s=137.54` — **tệ hơn một chút** so với baseline `fixed` không làm gì (134.35s, +~2.4%) và vẫn thua xa `actuated` (107.40s). Nhìn từng quyết định riêng lẻ, `effect` (before/after) tại điểm quyết định thường cho thấy cải thiện cục bộ ở đúng nút đó (vd. B2 tại 1441s: queue 34→27, wait 118→31s), nhưng B1 lại 2 lần liên tiếp tăng `cycle_s` (90→100→110s) trong lúc tắc mà `mean_waiting_s` tại B1 vẫn tiếp tục tăng trước khi giảm — khó tách bạch đâu là nhờ hành động, đâu là do sự cố tự kết thúc ở mốc 1800s. Kết luận trung thực: **fix đã chứng minh đúng cơ chế nó nhắm tới (agent phá được sự thụ động, biết hành động + phối hợp khi có bằng chứng bền vững)**, nhưng việc hành động không tự động đồng nghĩa với kết quả tốt hơn baseline đơn giản — tối ưu hoá thực sự để thắng `actuated` là bài toán khác, ngoài phạm vi DoD của Bước 14.
+
+### Cách chạy full (đã dùng, để tham khảo nếu cần chạy lại/seed khác)
+
+```bash
+source .venv/bin/activate
+python -m sumo_agents.sim.runner --scenario grid_4x4 --mode llm --seed 42
+```
+
+Xem kết quả run gần nhất:
+```bash
+python3 -c "
+import asyncio, sys; sys.path.insert(0, 'src')
+from sumo_agents.obs.db import make_async_engine, make_session_factory
+from sqlalchemy import text
+async def main():
+    engine = make_async_engine(); sf = make_session_factory(engine)
+    async with sf() as s:
+        r = await s.execute(text(\"SELECT run_id, summary, finished_at FROM runs WHERE mode='llm' ORDER BY started_at DESC LIMIT 1\"))
+        print(r.one())
+    await engine.dispose()
+asyncio.run(main())
+"
+```
+(Muốn thêm cột `llm` vào bảng so sánh Bước 9: `python scripts/compare.py --scenario grid_4x4 --modes fixed,actuated,maxpressure,llm --seeds 42` — chỉ 1 seed cho `llm` để không nhân 3 lần chi phí. Chưa chạy — tuỳ chọn.)
+
+> Nhắc lại từ plan §7: `llm` **có thể thua** `actuated`. Đúng như dự đoán — ở đây `llm` không chỉ thua mà còn hoàn toàn thụ động suốt sự cố. Ghi nhận trung thực (xem phát hiện ở trên) thay vì che giấu, rồi tuỳ người dùng quyết định: chấp nhận và sang Phase 3 (dashboard sẽ giúp debug trực quan hơn), hay dừng lại tinh chỉnh JunctionAgent trước.
 
 ---
 

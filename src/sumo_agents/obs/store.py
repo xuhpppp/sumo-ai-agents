@@ -71,9 +71,26 @@ class Store:
             session.add(Message(**fields))
             await session.commit()
 
-    async def add_decision(self, **fields: Any) -> None:
+    async def add_decision(self, **fields: Any) -> int:
+        """Returns the new row's id -- STEPS.md Step 14 needs it to come
+        back later (once the runner actually applies the action, and again
+        one cycle after that once `effect` can be measured) via
+        `update_decision`."""
         async with self._session_factory() as session:
-            session.add(Decision(**fields))
+            decision = Decision(**fields)
+            session.add(decision)
+            await session.commit()
+            await session.refresh(decision)
+            return decision.id
+
+    async def update_decision(self, decision_id: int, **fields: Any) -> None:
+        """Patch an existing `decisions` row -- STEPS.md Step 14 uses this
+        for `applied` (once the action is actually pushed via TraCI, which
+        `run_decision_cycle` itself never does -- only the sim loop touches
+        TraCI, plan section 3.1) and `effect` (one cycle later, see
+        obs/models.py's `Decision.effect` docstring)."""
+        async with self._session_factory() as session:
+            await session.execute(update(Decision).where(Decision.id == decision_id).values(**fields))
             await session.commit()
 
     async def add_llm_call(self, **fields: Any) -> None:

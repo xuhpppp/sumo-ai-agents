@@ -73,8 +73,14 @@ In the user message (never here -- this system message must stay \
 byte-identical across the whole run for prompt caching to work), you will \
 be given: sim_time, the duration of every phase in your current signal \
 program (so you know how much room you have before hitting the min/max \
-green limits below), and traffic metrics aggregated over your controlled \
-lanes (queue_len, mean_waiting_s, mean_speed, throughput, co2_mg).
+green limits below), traffic metrics aggregated over your controlled \
+lanes (queue_len, mean_waiting_s, mean_speed, throughput, co2_mg) for THIS \
+cycle, and -- when available -- the same metrics from your last few \
+decision cycles (oldest first), so you can judge whether a pattern is \
+persistent instead of a single noisy reading. On your very first decision \
+cycle in a run there is no history yet; treat that absence itself as "not \
+enough evidence of a persistent pattern," not as a reason to assume things \
+are fine.
 
 ## Your action space (intentionally narrow)
 
@@ -168,8 +174,29 @@ def _build_own_state_text(snapshot: JunctionSnapshot, tls_state: TlsState, sim_t
     )
 
 
-def _build_user_prompt(snapshot: JunctionSnapshot, tls_state: TlsState, sim_time: float) -> str:
-    return _build_own_state_text(snapshot, tls_state, sim_time)
+def _build_trend_text(history: list[JunctionSnapshot]) -> str:
+    """Last few decision cycles' metrics, oldest first -- STEPS.md Step 14
+    follow-up: a real full-hour run found the model refusing to act on real
+    congestion because a single snapshot alone is "not enough evidence of a
+    persistent pattern" per its own stated reasoning (the system prompt
+    explicitly warns against reacting to one noisy reading). This gives it
+    the multi-cycle evidence it was asking for, without changing the action
+    space or the safety validator."""
+    if not history:
+        return "trend_last_cycles: (none -- this is the first decision cycle for this junction in this run)\n"
+    queue = ", ".join(str(s.queue_len) for s in history)
+    waiting = ", ".join(f"{s.mean_waiting_s:.1f}" for s in history)
+    speed = ", ".join(f"{s.mean_speed:.1f}" for s in history)
+    return (
+        f"trend_last_{len(history)}_cycles (oldest first, one entry per past decision cycle): "
+        f"queue_len=[{queue}] mean_waiting_s=[{waiting}] mean_speed_mps=[{speed}]\n"
+    )
+
+
+def _build_user_prompt(
+    snapshot: JunctionSnapshot, tls_state: TlsState, sim_time: float, history: list[JunctionSnapshot] | None = None
+) -> str:
+    return _build_own_state_text(snapshot, tls_state, sim_time) + _build_trend_text(history or [])
 
 
 def _build_reply_user_prompt(
@@ -196,11 +223,14 @@ class JunctionAgent:
         self._system = _build_system_prompt(junction_id, self.neighbor_ids)
         # v3: Step 13 added the coalition-round + untrusted-data sections to
         # the system prompt (v2), then corrected the reply output-format
-        # description after the `Message.payload` schema fix above (v3) --
-        # bump the version whenever the system prompt text itself changes
+        # description after the `Message.payload` schema fix above (v3).
+        # v4: Step 14 follow-up added the multi-cycle trend section (a real
+        # full-hour run found the model staying passive through real
+        # congestion, citing "only one cycle of data" as its own reason).
+        # Bump the version whenever the system prompt text itself changes
         # (agents/llm.py's docstring), since a stale cache_key would just
         # miss the cache, not error.
-        self._cache_key = f"junction:{junction_id}:v3"
+        self._cache_key = f"junction:{junction_id}:v4"
 
     async def observe(
         self,
@@ -208,14 +238,17 @@ class JunctionAgent:
         tls_state: TlsState,
         sim_time: float,
         *,
+        history: list[JunctionSnapshot] | None = None,
         client: AsyncOpenAI | None = None,
     ) -> tuple[Proposal, Usage]:
         """Round 1: self-assessment only. Always returns a valid `Proposal`
         (never `None`) -- on an LLM failure this falls back to `no_action`
         for the cycle, per agents/llm.py's "sim never waits for LLM"
         contract (`client` is injectable for tests, same DI pattern as
-        `ask()` itself)."""
-        user = _build_user_prompt(snapshot, tls_state, sim_time)
+        `ask()` itself). `history`: this junction's own snapshots from its
+        last few decision cycles, oldest first, NOT including `snapshot`
+        itself -- see `_build_trend_text`."""
+        user = _build_user_prompt(snapshot, tls_state, sim_time, history)
         parsed, usage = await ask(
             "junction", self._system, user, Proposal, cache_key=self._cache_key, client=client
         )
