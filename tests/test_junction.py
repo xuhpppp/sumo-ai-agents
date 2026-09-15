@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 from sumo_agents.agents.junction import JunctionAgent, _build_system_prompt
 from sumo_agents.agents.protocol import Message, Proposal
-from sumo_agents.safety.validator import AdjustPhaseSplit, NoAction, PhaseState, TlsState
+from sumo_agents.safety.validator import NoAction, PhaseState, SetGreenBounds, TlsState
 from sumo_agents.sim.state import JunctionSnapshot
 
 _SNAPSHOT = JunctionSnapshot(
@@ -81,7 +81,7 @@ def test_system_prompt_carries_the_untrusted_data_notice() -> None:
 async def test_observe_returns_the_parsed_proposal_on_success() -> None:
     reply = Proposal(
         junction_id="B1",
-        action=AdjustPhaseSplit(junction_id="B1", phase_id="0", delta_s=5.0),
+        action=SetGreenBounds(junction_id="B1", phase_id="0", min_green_s=20.0, max_green_s=90.0),
         urgency="medium",
         rationale="Hàng đợi hướng chính đang tăng.",
     )
@@ -91,7 +91,7 @@ async def test_observe_returns_the_parsed_proposal_on_success() -> None:
     proposal, usage = await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
 
     assert proposal.junction_id == "B1"
-    assert isinstance(proposal.action, AdjustPhaseSplit)
+    assert isinstance(proposal.action, SetGreenBounds)
     assert usage.status == "ok"
     assert usage.cached_tokens == 1400
 
@@ -100,7 +100,7 @@ async def test_observe_normalizes_a_junction_id_mismatch() -> None:
     # The model echoed the wrong junction_id -- must not silently propagate.
     reply = Proposal(
         junction_id="WRONG",
-        action=AdjustPhaseSplit(junction_id="WRONG", phase_id="0", delta_s=5.0),
+        action=SetGreenBounds(junction_id="WRONG", phase_id="0", min_green_s=20.0, max_green_s=90.0),
         urgency="medium",
         rationale="x",
     )
@@ -148,6 +148,36 @@ async def test_observe_passes_trend_history_into_the_user_prompt() -> None:
     assert "trend_last_2_cycles" in user_prompt
     assert "queue_len=[12, 28]" in user_prompt
     assert "mean_waiting_s=[20.1, 55.3]" in user_prompt
+
+
+async def test_observe_passes_per_phase_breakdown_into_the_user_prompt() -> None:
+    # STEPS.md Step 14 follow-up #2: queue_len/mean_waiting_s above are
+    # junction-wide totals -- adjust_phase_split needs a per-phase_id
+    # breakdown to pick the right phase instead of guessing.
+    reply = Proposal(junction_id="B1", action=NoAction(junction_id="B1"), urgency="low", rationale="x")
+    client = _FakeClient(_fake_response(reply))
+    agent = JunctionAgent("B1", ["A1"])
+    per_phase = {
+        "0": {"queue_len": 40, "mean_waiting_s": 90.5},
+        "2": {"queue_len": 3, "mean_waiting_s": 1.2},
+    }
+
+    await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=90.0, per_phase=per_phase, client=client)
+
+    user_prompt = client.responses.calls[0]["input"][1]["content"]
+    assert "phase 0: queue_len=40 mean_waiting_s=90.5" in user_prompt
+    assert "phase 2: queue_len=3 mean_waiting_s=1.2" in user_prompt
+
+
+async def test_observe_omits_per_phase_section_when_not_given() -> None:
+    reply = Proposal(junction_id="B1", action=NoAction(junction_id="B1"), urgency="low", rationale="x")
+    client = _FakeClient(_fake_response(reply))
+    agent = JunctionAgent("B1", ["A1"])
+
+    await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
+
+    user_prompt = client.responses.calls[0]["input"][1]["content"]
+    assert "per_phase_queue" not in user_prompt
 
 
 async def test_observe_falls_back_to_no_action_on_llm_failure() -> None:
@@ -209,7 +239,7 @@ async def test_reply_uses_the_same_system_prompt_and_cache_key_as_observe() -> N
     await agent.reply(_INCOMING, _SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
 
     (call,) = client.responses.calls
-    assert call["prompt_cache_key"] == "junction:B1:v4"
+    assert call["prompt_cache_key"] == "junction:B1:v6"
     assert call["input"][0]["content"] == agent._system
 
 
@@ -226,7 +256,7 @@ async def test_observe_passes_cache_key_and_schema_through_to_ask() -> None:
     await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
 
     (call,) = client.responses.calls
-    assert call["prompt_cache_key"] == "junction:B1:v4"
+    assert call["prompt_cache_key"] == "junction:B1:v6"
     assert call["text_format"] is Proposal
     assert call["model"] == "gpt-5.6-luna"
     assert call["input"][0]["role"] == "system"

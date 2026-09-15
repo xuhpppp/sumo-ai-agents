@@ -11,8 +11,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from sumo_agents.agents.protocol import AdjustPhaseSplit, Verdict
+from sumo_agents.agents.protocol import SetGreenBounds, Verdict
 from sumo_agents.agents.supervisor import SupervisorAgent, SupervisorCandidate
+from sumo_agents.safety.validator import AdjustPhaseSplit
 
 _CANDIDATE_A = SupervisorCandidate(
     junction_id="B1",
@@ -78,7 +79,7 @@ async def test_review_uses_the_models_verdicts_when_they_cover_every_candidate()
         Verdict(
             junction_id="C1",
             decision="modified",
-            modified_action=AdjustPhaseSplit(junction_id="C1", phase_id="0", delta_s=4.0),
+            modified_action=SetGreenBounds(junction_id="C1", phase_id="0", min_green_s=7.0, max_green_s=40.0),
             reason="Giảm bớt để tránh xung đột với B1.",
         ),
     ]

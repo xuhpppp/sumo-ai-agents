@@ -47,7 +47,7 @@ from sumo_agents.obs.db import make_async_engine, make_session_factory
 from sumo_agents.obs.models import LlmCall
 from sumo_agents.obs.store import Store
 from sumo_agents.safety.validator import TlsState, validate
-from sumo_agents.sim.actuators import apply_action, read_tls_state
+from sumo_agents.sim.actuators import apply_action, per_phase_traffic, phase_lane_groups, read_tls_state
 from sumo_agents.sim.conn import Backend, SumoConnection
 from sumo_agents.sim.incidents import IncidentInjector, load_incident_schedule
 from sumo_agents.sim.state import JunctionSnapshot, collect_state, traffic_light_ids
@@ -68,18 +68,30 @@ NETWORKS_DIR = Path(__file__).resolve().parents[3] / "networks"
 # mode -> .sumocfg filename under networks/<scenario>/. Only "actuated"
 # needs a different network file (net_actuated.xml -- every <tlLogic>
 # rebuilt to type="actuated" via netconvert, see sim_actuated.sumocfg's
-# header comment); every other mode controls the standard static network
+# header comment); `fixed`/`maxpressure` control the standard static network
 # via Action/validator instead.
-_SUMOCFG_BY_MODE: dict[str, str] = {"actuated": "sim_actuated.sumocfg"}
+#
+# `llm` ALSO loads the actuated network (STEPS.md Step 14 actuated-hybrid
+# follow-up) -- a real full-hour run found periodic retiming on the static
+# network structurally capped well below `actuated`'s result (~134-148s vs
+# 107s mean travel time, three separate runs), because ANY fixed-interval
+# controller (ours included, however well-informed) can only change future
+# cycles' plan, never react within one the way SUMO's own per-step
+# induction-loop gap-out logic does. So `llm` mode now runs the SAME
+# actuated base layer for all 36 junctions (not just the 6 LLM-controlled
+# ones), and JunctionAgent's action space (agents/protocol.py's
+# `ActionUnion`) changed from "set an exact duration" to `SetGreenBounds`
+# -- the strategic min/max the actuated engine is allowed to vary within.
+_SUMOCFG_BY_MODE: dict[str, str] = {"actuated": "sim_actuated.sumocfg", "llm": "sim_actuated.sumocfg"}
 _DEFAULT_SUMOCFG = "sim.sumocfg"
 
 # The 4-6 signalized junctions that get an LLM JunctionAgent in mode="llm"
 # (plan section 2: "4-6 la tran thuc dung" -- cost/latency scale with
 # n_agents). Same 2x3 connected block used throughout Steps 12/13's
 # verification scripts, so their neighbor relationships (agents/topology.py)
-# are meaningful, not arbitrary. Every other signalized junction keeps
-# running its default static program untouched -- a JunctionAgent's own
-# system prompt already says as much (agents/junction.py).
+# are meaningful, not arbitrary. Every other signalized junction runs SUMO's
+# own actuated logic, unmanaged by any agent -- same as the `actuated`
+# baseline treats the whole network.
 LLM_AGENT_JUNCTIONS = ["B0", "B1", "B2", "C0", "C1", "C2"]
 
 
@@ -113,15 +125,24 @@ async def _run_llm_decision_cycle(
     run_id: uuid.UUID,
     store: Store,
     history: dict[str, list[JunctionSnapshot]] | None = None,
+    per_phase: dict[str, dict[str, dict[str, float | int]]] | None = None,
 ) -> list[CycleDecision]:
     """Round 1 (observe, parallel -- STEPS.md Step 12) + rounds 2-4
     (agents/orchestrator.py, Step 13), together as ONE background task --
     this whole function is plan section 3.2's `orchestrator.decide(snapshot)`.
     `history`: each junction's own snapshots from its last few decision
-    cycles (STEPS.md Step 14 follow-up -- see `JunctionAgent.observe`)."""
+    cycles (STEPS.md Step 14 follow-up -- see `JunctionAgent.observe`).
+    `per_phase`: each junction's queue/wait broken down by green phase_id
+    (STEPS.md Step 14 follow-up #2)."""
     history = history or {}
+    per_phase = per_phase or {}
     observe_results = await asyncio.gather(
-        *(agents[jid].observe(snapshots[jid], tls_states[jid], sim_time, history=history.get(jid)) for jid in agents)
+        *(
+            agents[jid].observe(
+                snapshots[jid], tls_states[jid], sim_time, history=history.get(jid), per_phase=per_phase.get(jid)
+            )
+            for jid in agents
+        )
     )
     proposals: dict[str, Proposal] = {}
     for jid, (proposal, usage) in zip(agents.keys(), observe_results, strict=True):
@@ -265,10 +286,18 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
             conn.start(sumo_cfg, seed=seed)
             junction_ids = traffic_light_ids(conn)
             if is_llm_mode:
-                llm_neighbor_map = signalized_neighbor_map(scenario_dir / "net.xml")
+                # Same lane/link topology as net.xml (netconvert only
+                # changed tls.default-type) -- read from the actuated file
+                # for consistency with what `conn` actually has loaded.
+                llm_neighbor_map = signalized_neighbor_map(scenario_dir / "net_actuated.xml")
                 llm_agents = {jid: JunctionAgent(jid, llm_neighbor_map[jid]) for jid in LLM_AGENT_JUNCTIONS}
                 supervisor = SupervisorAgent()
                 controller_observe = None
+                # Link/lane topology per junction never changes over a run
+                # (STEPS.md Step 14 follow-up #2, same reasoning as
+                # MaxPressureController's own `_movements` cache) -- build
+                # once, reuse every decision cycle.
+                llm_phase_lane_groups = {jid: phase_lane_groups(conn, jid) for jid in LLM_AGENT_JUNCTIONS}
             else:
                 controller = make_controller(mode, conn)
                 # Optional per-controller hook, not part of the shared Controller
@@ -361,6 +390,10 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
                                 for jid in LLM_AGENT_JUNCTIONS:
                                     snapshot_history[jid].append(agent_snapshots[jid])
                                     del snapshot_history[jid][:-SNAPSHOT_HISTORY_LEN]
+                                agent_per_phase = {
+                                    jid: per_phase_traffic(conn, llm_phase_lane_groups[jid])
+                                    for jid in LLM_AGENT_JUNCTIONS
+                                }
                                 pending_task = asyncio.create_task(
                                     _run_llm_decision_cycle(
                                         llm_agents,
@@ -373,6 +406,7 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
                                         run_id,
                                         store,
                                         history=agent_history,
+                                        per_phase=agent_per_phase,
                                     )
                                 )
                                 pending_task_snapshots = agent_snapshots

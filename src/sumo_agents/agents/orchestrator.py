@@ -221,7 +221,11 @@ async def _run_coalition_round(
         if not recipients:
             continue
         proposal = proposals[jid]
-        intent = "propose" if proposal.action.type == "set_offset" else "request_help"
+        # Every broadcastable action (STEPS.md Step 14 actuated-hybrid
+        # follow-up: just set_green_bounds now, set_offset is retired) is
+        # inherently self-scoped -- "request_help" fits all of them; there
+        # is no longer an action type that names a neighbor directly.
+        intent = "request_help"
         broadcasts.append(
             Message(
                 sender=jid,

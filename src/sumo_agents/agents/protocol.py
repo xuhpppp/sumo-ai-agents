@@ -25,13 +25,7 @@ from typing import Literal, Union
 
 from pydantic import BaseModel, model_validator
 
-from sumo_agents.safety.validator import (
-    AdjustPhaseSplit,
-    NoAction,
-    RequestVms,
-    SetCycleLength,
-    SetOffset,
-)
+from sumo_agents.safety.validator import NoAction, RequestVms, SetGreenBounds
 
 # NOT `Field(discriminator="type")`: that reads better locally (Pydantic
 # dispatches on the `type` literal instead of trying every union member,
@@ -44,7 +38,17 @@ from sumo_agents.safety.validator import (
 # structured outputs do support -- this type is used as the literal
 # `text_format` schema handed to `ask()`, so it must satisfy OpenAI's
 # subset of JSON Schema, not just Pydantic's.
-ActionUnion = Union[AdjustPhaseSplit, SetCycleLength, SetOffset, RequestVms, NoAction]
+#
+# STEPS.md Step 14 actuated-hybrid follow-up: `AdjustPhaseSplit`/
+# `SetCycleLength`/`SetOffset` used to be here too, but `llm` mode now runs
+# on an actuated network (SUMO's own induction-loop logic owns moment-to-
+# moment phase timing) -- those three actions' "set an exact duration/
+# cycle/offset" semantics no longer apply to what the agent controls.
+# `SetGreenBounds` is the one lever that does: the strategic min/max an
+# actuated phase is allowed to vary within. The three retired types stay
+# defined in `safety/validator.py` for any other caller (none currently);
+# they are just no longer offered to the LLM.
+ActionUnion = Union[SetGreenBounds, RequestVms, NoAction]
 
 
 class Proposal(BaseModel):

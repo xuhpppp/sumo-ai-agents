@@ -20,7 +20,7 @@ from sumo_agents.agents.protocol import Message, Proposal, Verdict
 from sumo_agents.obs.models import Decision
 from sumo_agents.obs.models import Message as MessageRow
 from sumo_agents.obs.store import Store
-from sumo_agents.safety.validator import AdjustPhaseSplit, NoAction, PhaseState, TlsState
+from sumo_agents.safety.validator import NoAction, PhaseState, SetGreenBounds, TlsState
 
 _TLS = TlsState(
     junction_id="_",
@@ -89,7 +89,7 @@ def _proposals() -> dict[str, Proposal]:
     return {
         "J1": Proposal(
             junction_id="J1",
-            action=AdjustPhaseSplit(junction_id="J1", phase_id="0", delta_s=10.0),  # valid, congested
+            action=SetGreenBounds(junction_id="J1", phase_id="0", min_green_s=30.0, max_green_s=90.0),  # valid, congested
             urgency="high",
             rationale="Hàng đợi J1 tăng nhanh.",
         ),
@@ -104,7 +104,7 @@ def _proposals() -> dict[str, Proposal]:
             # Deliberately invalid: phase_id "1" is yellow (see _TLS) --
             # validator.py must reject this before it ever reaches the
             # supervisor. This is the Step 13 DoD's required case.
-            action=AdjustPhaseSplit(junction_id="J3", phase_id="1", delta_s=5.0),
+            action=SetGreenBounds(junction_id="J3", phase_id="1", min_green_s=10.0, max_green_s=50.0),
             urgency="high",
             rationale="J3 cố ý vi phạm để test validator.",
         ),

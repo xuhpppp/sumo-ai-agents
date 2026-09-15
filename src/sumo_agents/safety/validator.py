@@ -38,6 +38,13 @@ class PhaseState:
     phase_id: str
     duration_s: float
     kind: PhaseKind
+    # Actuated-mode bounds (STEPS.md Step 14 actuated-hybrid follow-up) --
+    # every SUMO tlLogic phase carries minDur/maxDur regardless of program
+    # `type`, but only an `type="actuated"` program actually enforces them
+    # (a `type="static"` program ignores them entirely). Default 0.0 for
+    # callers that never populate them (baselines on the static network).
+    min_dur_s: float = 0.0
+    max_dur_s: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +83,24 @@ class SetOffset(BaseModel):
     offset_s: float
 
 
+class SetGreenBounds(BaseModel):
+    """Set one GREEN phase's actuated min/max duration -- STEPS.md Step 14
+    actuated-hybrid follow-up. Only meaningful on a `type="actuated"`
+    program (SUMO's own induction-loop gap-out logic reads these bounds
+    every simulation step and extends/truncates the phase live between
+    them); on a `type="static"` program the values are accepted but never
+    enforced. Replaces `AdjustPhaseSplit`/`SetCycleLength`/`SetOffset` in
+    `agents/protocol.py`'s `ActionUnion` (what JunctionAgent/SupervisorAgent
+    can actually propose) -- those three stay defined here for any other
+    caller, they are just no longer offered to the LLM."""
+
+    type: Literal["set_green_bounds"] = "set_green_bounds"
+    junction_id: str
+    phase_id: str
+    min_green_s: float
+    max_green_s: float
+
+
 class RequestVms(BaseModel):
     type: Literal["request_vms"] = "request_vms"
     junction_id: str
@@ -92,7 +117,7 @@ class NoAction(BaseModel):
     junction_id: str
 
 
-Action = Union[AdjustPhaseSplit, SetCycleLength, SetOffset, RequestVms, NoAction]
+Action = Union[AdjustPhaseSplit, SetCycleLength, SetOffset, SetGreenBounds, RequestVms, NoAction]
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +139,8 @@ def validate(action: Action, tls_state: TlsState) -> ValidationResult:
         return _validate_set_cycle_length(action)
     if isinstance(action, SetOffset):
         return _validate_set_offset(action)
+    if isinstance(action, SetGreenBounds):
+        return _validate_set_green_bounds(action, tls_state)
     if isinstance(action, RequestVms):
         return _validate_request_vms(action)
     raise TypeError(f"unhandled action type: {type(action)!r}")
@@ -186,6 +213,72 @@ def _validate_set_offset(action: SetOffset) -> ValidationResult:
     if clamped != action.offset_s:
         violations.append(f"offset_s={action.offset_s} outside [0, {hi}], clamped to {clamped}")
     return ValidationResult(ok=True, violations=violations, clamped_action=action.model_copy(update={"offset_s": clamped}))
+
+
+def _validate_set_green_bounds(action: SetGreenBounds, tls_state: TlsState) -> ValidationResult:
+    phase = tls_state.phase(action.phase_id)
+    if phase is None:
+        return ValidationResult(
+            ok=False,
+            violations=[f"unknown phase_id {action.phase_id!r} at junction {tls_state.junction_id!r}"],
+            clamped_action=None,
+        )
+    if phase.kind != "green":
+        return ValidationResult(
+            ok=False,
+            violations=[f"phase {action.phase_id!r} is {phase.kind!r}, agents cannot set green bounds on yellow/all-red phases"],
+            clamped_action=None,
+        )
+    if action.min_green_s > action.max_green_s:
+        return ValidationResult(
+            ok=False,
+            violations=[f"min_green_s={action.min_green_s} > max_green_s={action.max_green_s}"],
+            clamped_action=None,
+        )
+
+    violations: list[str] = []
+    lo, hi = HARD_CONSTRAINTS["min_green_s"], HARD_CONSTRAINTS["max_green_s"]
+    min_g = _clamp(action.min_green_s, lo, hi)
+    max_g = _clamp(action.max_green_s, lo, hi)
+    if min_g != action.min_green_s or max_g != action.max_green_s:
+        violations.append(
+            f"[min_green_s, max_green_s]=[{action.min_green_s}, {action.max_green_s}] outside "
+            f"[{lo}, {hi}], clamped to [{min_g}, {max_g}]"
+        )
+
+    # Anti-oscillation, same idea as AdjustPhaseSplit's max_delta_per_cycle_s
+    # -- applied to each bound independently, against the CURRENT bounds
+    # (`phase.min_dur_s`/`max_dur_s`), not the requested values.
+    max_delta = HARD_CONSTRAINTS["max_delta_per_cycle_s"]
+    clamped_min = _clamp(min_g, phase.min_dur_s - max_delta, phase.min_dur_s + max_delta)
+    clamped_max = _clamp(max_g, phase.max_dur_s - max_delta, phase.max_dur_s + max_delta)
+    if clamped_min != min_g or clamped_max != max_g:
+        violations.append(
+            f"bounds moved more than max_delta_per_cycle_s={max_delta} from current "
+            f"[{phase.min_dur_s}, {phase.max_dur_s}], clamped to [{clamped_min}, {clamped_max}]"
+        )
+
+    if clamped_max < phase.max_dur_s:
+        starved_for = tls_state.time_since_last_green_s.get(action.phase_id, 0.0)
+        max_starvation = HARD_CONSTRAINTS["max_starvation_s"]
+        if starved_for >= max_starvation:
+            return ValidationResult(
+                ok=False,
+                violations=[
+                    f"phase {action.phase_id!r} already starved for {starved_for}s "
+                    f">= max_starvation_s={max_starvation}, refusing to shrink its max_green_s further"
+                ],
+                clamped_action=None,
+            )
+
+    if clamped_min > clamped_max:
+        clamped_min = clamped_max  # the two independent per-bound clamps above can cross at the edges
+
+    return ValidationResult(
+        ok=True,
+        violations=violations,
+        clamped_action=action.model_copy(update={"min_green_s": clamped_min, "max_green_s": clamped_max}),
+    )
 
 
 def _validate_request_vms(action: RequestVms) -> ValidationResult:

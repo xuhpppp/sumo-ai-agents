@@ -15,7 +15,7 @@ from sumo_agents.agents.protocol import (
     Verdict,
     wrap_untrusted_data,
 )
-from sumo_agents.safety.validator import AdjustPhaseSplit, NoAction
+from sumo_agents.safety.validator import NoAction, SetGreenBounds
 
 
 def _valid_proposal_json(action: dict) -> str:
@@ -29,12 +29,18 @@ def _valid_proposal_json(action: dict) -> str:
     )
 
 
-def test_proposal_parses_adjust_phase_split_into_the_correct_concrete_type() -> None:
-    action = {"type": "adjust_phase_split", "junction_id": "J07", "phase_id": "0", "delta_s": 10.0}
+def test_proposal_parses_set_green_bounds_into_the_correct_concrete_type() -> None:
+    action = {
+        "type": "set_green_bounds",
+        "junction_id": "J07",
+        "phase_id": "0",
+        "min_green_s": 20.0,
+        "max_green_s": 90.0,
+    }
     proposal = Proposal.model_validate_json(_valid_proposal_json(action))
 
-    assert isinstance(proposal.action, AdjustPhaseSplit)
-    assert proposal.action.delta_s == 10.0
+    assert isinstance(proposal.action, SetGreenBounds)
+    assert proposal.action.max_green_s == 90.0
     assert proposal.urgency == "medium"
 
 
@@ -47,7 +53,7 @@ def test_proposal_parses_no_action() -> None:
 
 def test_proposal_with_unknown_action_type_raises_clearly() -> None:
     # This is the DoD case: a model returning JSON that doesn't match the
-    # schema (here, an action `type` outside the 5 known literals) must
+    # schema (here, an action `type` outside the 3 known literals) must
     # raise, not silently pass through as some default action.
     action = {"type": "teleport_all_vehicles", "junction_id": "J07"}
 
@@ -117,10 +123,10 @@ def test_verdict_modified_with_action_is_valid() -> None:
     verdict = Verdict(
         junction_id="J07",
         decision="modified",
-        modified_action=AdjustPhaseSplit(junction_id="J07", phase_id="0", delta_s=5.0),
-        reason="Giảm delta_s từ 15 xuống 5 để tránh dao động.",
+        modified_action=SetGreenBounds(junction_id="J07", phase_id="0", min_green_s=15.0, max_green_s=50.0),
+        reason="Giảm max_green_s từ 90 xuống 50 để tránh dao động.",
     )
-    assert isinstance(verdict.modified_action, AdjustPhaseSplit)
+    assert isinstance(verdict.modified_action, SetGreenBounds)
 
 
 def test_wrap_untrusted_data_has_unambiguous_delimiters() -> None:

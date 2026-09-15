@@ -21,6 +21,7 @@ from sumo_agents.safety.validator import (
     PhaseState,
     RequestVms,
     SetCycleLength,
+    SetGreenBounds,
     SetOffset,
     TlsState,
     validate,
@@ -196,6 +197,93 @@ def test_set_offset_above_max_cycle_clamped() -> None:
     result = validate(action, _tls_state())
     assert result.ok
     assert result.clamped_action.offset_s == HARD_CONSTRAINTS["max_cycle_s"]
+
+
+# -- set_green_bounds (STEPS.md Step 14 actuated-hybrid follow-up) ----------
+
+
+def _tls_state_with_bounds(**time_since_last_green_s: float) -> TlsState:
+    """Like `_tls_state()`, but the green phases carry realistic current
+    min_dur_s/max_dur_s (net_actuated.xml's real defaults: [7, 90], already
+    the widest legal range) -- `_tls_state()`'s phases default to
+    min_dur_s=max_dur_s=0.0, which would make every SetGreenBounds request
+    look like a huge jump against max_delta_per_cycle_s."""
+    return TlsState(
+        junction_id="J12",
+        phases=(
+            PhaseState(phase_id="NS", duration_s=30.0, kind="green", min_dur_s=7.0, max_dur_s=90.0),
+            PhaseState(phase_id="NS_Y", duration_s=3.0, kind="yellow"),
+            PhaseState(phase_id="AR1", duration_s=2.0, kind="all_red"),
+            PhaseState(phase_id="EW", duration_s=25.0, kind="green", min_dur_s=7.0, max_dur_s=90.0),
+        ),
+        time_since_last_green_s=time_since_last_green_s,
+    )
+
+
+def test_set_green_bounds_within_bounds_passes_unchanged() -> None:
+    action = SetGreenBounds(junction_id="J12", phase_id="NS", min_green_s=15.0, max_green_s=90.0)
+    result = validate(action, _tls_state_with_bounds())
+    assert result.ok
+    assert result.violations == []
+    assert result.clamped_action.min_green_s == 15.0
+    assert result.clamped_action.max_green_s == 90.0
+
+
+def test_set_green_bounds_rejects_min_greater_than_max() -> None:
+    action = SetGreenBounds(junction_id="J12", phase_id="NS", min_green_s=50.0, max_green_s=10.0)
+    result = validate(action, _tls_state_with_bounds())
+    assert not result.ok
+    assert result.clamped_action is None
+    assert "min_green_s" in result.violations[0]
+
+
+def test_set_green_bounds_clamped_to_hard_constraints() -> None:
+    action = SetGreenBounds(junction_id="J12", phase_id="NS", min_green_s=1.0, max_green_s=999.0)
+    result = validate(action, _tls_state_with_bounds())
+    assert result.ok
+    assert result.clamped_action.min_green_s == HARD_CONSTRAINTS["min_green_s"]
+    assert result.clamped_action.max_green_s == HARD_CONSTRAINTS["max_green_s"]
+    assert result.violations
+
+
+def test_set_green_bounds_anti_oscillation_clamps_large_jump() -> None:
+    # Current bounds [7, 90]; requesting min_green_s=40 is a 33s jump, well
+    # over max_delta_per_cycle_s=15.
+    action = SetGreenBounds(junction_id="J12", phase_id="NS", min_green_s=40.0, max_green_s=90.0)
+    result = validate(action, _tls_state_with_bounds())
+    assert result.ok
+    assert result.clamped_action.min_green_s == 7.0 + HARD_CONSTRAINTS["max_delta_per_cycle_s"]
+    assert any("max_delta_per_cycle_s" in v for v in result.violations)
+
+
+def test_set_green_bounds_rejects_shrinking_max_on_an_already_starved_phase() -> None:
+    state = _tls_state_with_bounds(NS=HARD_CONSTRAINTS["max_starvation_s"])
+    action = SetGreenBounds(junction_id="J12", phase_id="NS", min_green_s=7.0, max_green_s=80.0)
+    result = validate(action, state)
+    assert not result.ok
+    assert result.clamped_action is None
+    assert "starved" in result.violations[0]
+
+
+def test_set_green_bounds_allows_raising_max_on_a_starved_phase() -> None:
+    state = _tls_state_with_bounds(NS=HARD_CONSTRAINTS["max_starvation_s"])
+    action = SetGreenBounds(junction_id="J12", phase_id="NS", min_green_s=15.0, max_green_s=90.0)
+    result = validate(action, state)
+    assert result.ok
+
+
+def test_set_green_bounds_rejects_unknown_phase() -> None:
+    action = SetGreenBounds(junction_id="J12", phase_id="NOPE", min_green_s=10.0, max_green_s=50.0)
+    result = validate(action, _tls_state_with_bounds())
+    assert not result.ok
+    assert result.clamped_action is None
+
+
+def test_set_green_bounds_rejects_yellow_phase() -> None:
+    action = SetGreenBounds(junction_id="J12", phase_id="NS_Y", min_green_s=10.0, max_green_s=50.0)
+    result = validate(action, _tls_state_with_bounds())
+    assert not result.ok
+    assert result.clamped_action is None
 
 
 # -- request_vms -------------------------------------------------------------

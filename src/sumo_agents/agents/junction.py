@@ -62,39 +62,52 @@ network may be controlled by a different (non-LLM) policy instead.
 ## Your position in the network
 
 Your directly-connected neighboring signalized junctions, inferred from the \
-actual road network topology (not hardcoded): {neighbor_ids}. These are the \
-only junctions a coordination action like `set_offset` can meaningfully \
-target -- a junction you are not directly connected to would not be \
-affected by anything you do.
+actual road network topology (not hardcoded): {neighbor_ids}. These are \
+the only junctions whose coalition messages can meaningfully concern you, \
+and the only ones your own state is meaningfully relevant to -- a junction \
+you are not directly connected to would not be affected by anything you do.
 
-## What you will be shown each cycle
+## How your junction actually runs the signal
 
-In the user message (never here -- this system message must stay \
-byte-identical across the whole run for prompt caching to work), you will \
-be given: sim_time, the duration of every phase in your current signal \
-program (so you know how much room you have before hitting the min/max \
-green limits below), traffic metrics aggregated over your controlled \
-lanes (queue_len, mean_waiting_s, mean_speed, throughput, co2_mg) for THIS \
-cycle, and -- when available -- the same metrics from your last few \
-decision cycles (oldest first), so you can judge whether a pattern is \
-persistent instead of a single noisy reading. On your very first decision \
-cycle in a run there is no history yet; treat that absence itself as "not \
-enough evidence of a persistent pattern," not as a reason to assume things \
-are fine.
+Your traffic light does NOT run a fixed-duration program. It runs SUMO's \
+own actuated (induction-loop, gap-out) logic: a detector sits at each \
+stop line, and every simulation step the controller decides, on its own, \
+whether to keep extending the current GREEN phase (vehicles keep arriving \
+with a short enough gap between them) or switch to the next phase (the \
+gap grew too long, or the phase hit its max). This happens continuously, \
+far faster than you are ever asked to decide -- you are not that reactive \
+layer, and you cannot out-react it by deciding more often.
+
+Your job is the layer ABOVE that: once every decision cycle, you set the \
+[min_green_s, max_green_s] BOUNDS each green phase's actuated logic is \
+allowed to vary within. The actuated engine still makes every moment-to- \
+moment call itself; you are only narrowing or widening its room to \
+maneuver, based on things it structurally cannot see by itself -- a \
+multi-cycle trend, or what a neighboring junction just told you.
+
+Important: phases start at the widest legal range already \
+([{min_green_s}, {max_green_s}]s, the same range `set_green_bounds` is \
+clamped into), so "raise max_green_s for the congested phase" usually has \
+no room left to give -- it may already be at {max_green_s}s. The two \
+levers that actually change anything:
+  - Raise the CONGESTED phase's min_green_s: guarantees it a longer floor \
+even if the actuated engine would otherwise gap it out early on a \
+momentary lull.
+  - Lower the OTHER (competing) phase's max_green_s: stops that phase \
+from holding onto green time it doesn't urgently need, indirectly \
+returning more of the cycle to the congested one.
 
 ## Your action space (intentionally narrow)
 
 Propose exactly ONE of the following actions per decision cycle:
-  - adjust_phase_split(phase_id, delta_s): change one GREEN phase's \
-duration by delta_s seconds (positive = longer). abs(delta_s) must be \
-<= {max_delta_per_cycle_s} seconds per cycle, and the resulting duration \
-must stay within [{min_green_s}, {max_green_s}] seconds. Yellow \
+  - set_green_bounds(phase_id, min_green_s, max_green_s): set one GREEN \
+phase's actuated bounds. Both values are clamped into \
+[{min_green_s}, {max_green_s}] seconds, min_green_s must not exceed \
+max_green_s, and each bound can move at most {max_delta_per_cycle_s} \
+seconds per cycle from its CURRENT value (shown to you each cycle) -- \
+anti-oscillation, same idea as everywhere else in this system. Yellow \
 ({yellow_s}s, fixed) and all-red ({all_red_s}s, fixed) phases can never be \
-adjusted.
-  - set_cycle_length(cycle_s): change the total cycle length; must stay \
-within [{min_cycle_s}, {max_cycle_s}] seconds.
-  - set_offset(offset_s): shift your cycle's offset relative to one of the \
-neighbors listed above, to help form a green wave.
+touched.
   - request_vms(edge, alt_route, duration_s): ask for a variable-message- \
 sign detour onto a real edge; alt_route must not revisit an edge (no \
 routing loops).
@@ -108,12 +121,12 @@ your own reasoning rather than relying on the validator to fix things. A \
 junction must never go longer than {max_starvation_s} seconds without \
 seeing a green phase.
 
-Do not propose a change just to appear active: oscillating the signal \
-timing every cycle (e.g. alternating +Xs then -Xs) makes congestion worse, \
-not better, because vehicles already accelerating into a green phase get \
-caught by an unexpected early yellow. Only propose a change when the \
-observed pattern clearly and persistently justifies it -- a single noisy \
-reading is not enough justification on its own.
+Do not propose a change just to appear active: narrowing then widening \
+the same bound cycle after cycle makes congestion worse, not better, \
+because it fights the actuated engine's own moment-to-moment judgment \
+instead of complementing it. Only propose a change when the observed \
+pattern clearly and persistently justifies it -- a single noisy reading \
+is not enough justification on its own.
 
 ## Coalition round
 
@@ -161,7 +174,12 @@ def _build_system_prompt(junction_id: str, neighbor_ids: list[str]) -> str:
 
 
 def _build_own_state_text(snapshot: JunctionSnapshot, tls_state: TlsState, sim_time: float) -> str:
-    phases = "; ".join(f"phase {p.phase_id} ({p.kind})={p.duration_s:.0f}s" for p in tls_state.phases)
+    phases = "; ".join(
+        f"phase {p.phase_id} ({p.kind}) current_bounds=[{p.min_dur_s:.0f}, {p.max_dur_s:.0f}]s"
+        if p.kind == "green"
+        else f"phase {p.phase_id} ({p.kind})={p.duration_s:.0f}s"
+        for p in tls_state.phases
+    )
     return (
         f"sim_time={sim_time:.0f}s\n"
         f"current_phase_index={snapshot.current_phase}\n"
@@ -193,10 +211,37 @@ def _build_trend_text(history: list[JunctionSnapshot]) -> str:
     )
 
 
+def _build_per_phase_text(per_phase: dict[str, dict[str, float | int]]) -> str:
+    """Queue/wait broken down by GREEN phase_id -- STEPS.md Step 14
+    follow-up: `queue_len`/`mean_waiting_s` above are summed across the
+    WHOLE junction, so a real full-hour run found the model picking a
+    plausible-looking `phase_id` for `adjust_phase_split` by guesswork (it
+    said as much: "chưa có dữ liệu phân tách theo hướng"). This gives it
+    the same per-phase lane grouping `baselines/maxpressure.py` already
+    uses to pick which phase is actually congested."""
+    if not per_phase:
+        return ""
+    parts = [
+        f"phase {phase_id}: queue_len={m['queue_len']} mean_waiting_s={m['mean_waiting_s']:.1f}"
+        for phase_id, m in sorted(per_phase.items())
+    ]
+    return "per_phase_queue (only GREEN phases, use this -- not the junction-wide totals above -- to pick phase_id): " + "; ".join(
+        parts
+    ) + "\n"
+
+
 def _build_user_prompt(
-    snapshot: JunctionSnapshot, tls_state: TlsState, sim_time: float, history: list[JunctionSnapshot] | None = None
+    snapshot: JunctionSnapshot,
+    tls_state: TlsState,
+    sim_time: float,
+    history: list[JunctionSnapshot] | None = None,
+    per_phase: dict[str, dict[str, float | int]] | None = None,
 ) -> str:
-    return _build_own_state_text(snapshot, tls_state, sim_time) + _build_trend_text(history or [])
+    return (
+        _build_own_state_text(snapshot, tls_state, sim_time)
+        + _build_per_phase_text(per_phase or {})
+        + _build_trend_text(history or [])
+    )
 
 
 def _build_reply_user_prompt(
@@ -227,10 +272,19 @@ class JunctionAgent:
         # v4: Step 14 follow-up added the multi-cycle trend section (a real
         # full-hour run found the model staying passive through real
         # congestion, citing "only one cycle of data" as its own reason).
+        # v5: Step 14 follow-up #2 added the per-phase queue/wait breakdown
+        # (the model was picking phase_id by guesswork off a junction-wide
+        # total; it said so directly -- "chưa có dữ liệu phân tách theo
+        # hướng").
+        # v6: Step 14 actuated-hybrid follow-up -- action space replaced
+        # (adjust_phase_split/set_cycle_length/set_offset -> set_green_bounds)
+        # after 3 real full-hour runs found periodic retiming structurally
+        # capped well below `actuated`'s result; junction now runs on SUMO's
+        # own actuated engine, agent sets its strategic min/max bounds.
         # Bump the version whenever the system prompt text itself changes
         # (agents/llm.py's docstring), since a stale cache_key would just
         # miss the cache, not error.
-        self._cache_key = f"junction:{junction_id}:v4"
+        self._cache_key = f"junction:{junction_id}:v6"
 
     async def observe(
         self,
@@ -239,6 +293,7 @@ class JunctionAgent:
         sim_time: float,
         *,
         history: list[JunctionSnapshot] | None = None,
+        per_phase: dict[str, dict[str, float | int]] | None = None,
         client: AsyncOpenAI | None = None,
     ) -> tuple[Proposal, Usage]:
         """Round 1: self-assessment only. Always returns a valid `Proposal`
@@ -247,8 +302,9 @@ class JunctionAgent:
         contract (`client` is injectable for tests, same DI pattern as
         `ask()` itself). `history`: this junction's own snapshots from its
         last few decision cycles, oldest first, NOT including `snapshot`
-        itself -- see `_build_trend_text`."""
-        user = _build_user_prompt(snapshot, tls_state, sim_time, history)
+        itself -- see `_build_trend_text`. `per_phase`: queue/wait broken
+        down by GREEN phase_id -- see `_build_per_phase_text`."""
+        user = _build_user_prompt(snapshot, tls_state, sim_time, history, per_phase)
         parsed, usage = await ask(
             "junction", self._system, user, Proposal, cache_key=self._cache_key, client=client
         )
