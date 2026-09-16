@@ -15,6 +15,7 @@ import pytest
 
 from sumo_agents.safety import validator
 from sumo_agents.safety.validator import (
+    GREEN_BOUNDS_DECAY_PER_CYCLE_S,
     HARD_CONSTRAINTS,
     AdjustPhaseSplit,
     NoAction,
@@ -24,6 +25,7 @@ from sumo_agents.safety.validator import (
     SetGreenBounds,
     SetOffset,
     TlsState,
+    decay_green_bounds,
     validate,
 )
 
@@ -284,6 +286,90 @@ def test_set_green_bounds_rejects_yellow_phase() -> None:
     result = validate(action, _tls_state_with_bounds())
     assert not result.ok
     assert result.clamped_action is None
+
+
+# -- decay_green_bounds (STEPS.md Step 18 follow-up) ------------------------
+
+
+def _tls_state_with(*, ns_min: float, ns_max: float) -> TlsState:
+    return TlsState(
+        junction_id="J12",
+        phases=(
+            PhaseState(phase_id="NS", duration_s=30.0, kind="green", min_dur_s=ns_min, max_dur_s=ns_max),
+            PhaseState(phase_id="NS_Y", duration_s=3.0, kind="yellow"),
+            PhaseState(phase_id="AR1", duration_s=2.0, kind="all_red"),
+            PhaseState(
+                phase_id="EW",
+                duration_s=25.0,
+                kind="green",
+                min_dur_s=HARD_CONSTRAINTS["min_green_s"],
+                max_dur_s=HARD_CONSTRAINTS["max_green_s"],
+            ),
+        ),
+    )
+
+
+def test_decay_green_bounds_no_op_when_every_phase_already_at_default() -> None:
+    state = _tls_state_with(ns_min=HARD_CONSTRAINTS["min_green_s"], ns_max=HARD_CONSTRAINTS["max_green_s"])
+    assert decay_green_bounds(state) == []
+
+
+def test_decay_green_bounds_steps_min_down_toward_default() -> None:
+    # An agent ratcheted NS's min_green_s up to 75 over several cycles
+    # (STEPS.md Step 18's real finding); decay pulls it back down.
+    state = _tls_state_with(ns_min=75.0, ns_max=HARD_CONSTRAINTS["max_green_s"])
+    actions = decay_green_bounds(state)
+    assert len(actions) == 1
+    assert actions[0].junction_id == "J12"
+    assert actions[0].phase_id == "NS"
+    assert actions[0].min_green_s == 75.0 - GREEN_BOUNDS_DECAY_PER_CYCLE_S
+    assert actions[0].max_green_s == HARD_CONSTRAINTS["max_green_s"]  # already at default, untouched
+
+
+def test_decay_green_bounds_steps_max_up_toward_default() -> None:
+    # A phase's max_green_s was lowered (e.g. to free up cycle time for a
+    # competing phase) below the default widest range; decay raises it back.
+    state = _tls_state_with(ns_min=HARD_CONSTRAINTS["min_green_s"], ns_max=40.0)
+    actions = decay_green_bounds(state)
+    assert len(actions) == 1
+    assert actions[0].min_green_s == HARD_CONSTRAINTS["min_green_s"]
+    assert actions[0].max_green_s == 40.0 + GREEN_BOUNDS_DECAY_PER_CYCLE_S
+
+
+def test_decay_green_bounds_does_not_overshoot_past_default() -> None:
+    # Only 2s away from default (7) -- a 5s step must land exactly on 7,
+    # never past it to some lower, illegal value.
+    state = _tls_state_with(ns_min=9.0, ns_max=HARD_CONSTRAINTS["max_green_s"])
+    actions = decay_green_bounds(state)
+    assert len(actions) == 1
+    assert actions[0].min_green_s == HARD_CONSTRAINTS["min_green_s"]
+
+
+def test_decay_green_bounds_custom_step_can_reach_default_in_one_call() -> None:
+    state = _tls_state_with(ns_min=75.0, ns_max=HARD_CONSTRAINTS["max_green_s"])
+    actions = decay_green_bounds(state, decay_step_s=1000.0)
+    assert actions[0].min_green_s == HARD_CONSTRAINTS["min_green_s"]
+
+
+def test_decay_green_bounds_skips_yellow_and_all_red_phases() -> None:
+    # NS_Y/AR1 above default to 0.0/0.0 (never populated for non-green
+    # phases in practice) -- decay must never touch them regardless.
+    state = _tls_state_with(ns_min=HARD_CONSTRAINTS["min_green_s"], ns_max=HARD_CONSTRAINTS["max_green_s"])
+    actions = decay_green_bounds(state)
+    assert all(a.phase_id not in ("NS_Y", "AR1") for a in actions)
+
+
+def test_decay_green_bounds_result_passes_validate_unchanged() -> None:
+    # Defense-in-depth check (sim/runner.py still runs decay's output
+    # through validate()): a decayed action must never itself get
+    # clamped/rejected -- it is already legal and moving toward, not away
+    # from, the safe default.
+    state = _tls_state_with(ns_min=75.0, ns_max=HARD_CONSTRAINTS["max_green_s"])
+    action = decay_green_bounds(state)[0]
+    result = validate(action, state)
+    assert result.ok
+    assert result.violations == []
+    assert result.clamped_action == action
 
 
 # -- request_vms -------------------------------------------------------------

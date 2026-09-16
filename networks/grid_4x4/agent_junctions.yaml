@@ -1,0 +1,9 @@
+# The signalized junctions that get an LLM JunctionAgent in mode="llm"
+# (sim/runner.py's _load_agent_junctions, STEPS.md Step 18). Same 2x3
+# connected block used since Steps 12/13.
+- B0
+- B1
+- B2
+- C0
+- C1
+- C2

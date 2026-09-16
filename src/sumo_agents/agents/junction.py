@@ -36,6 +36,7 @@ from sumo_agents.agents.protocol import (
 )
 from sumo_agents.agents.topology import NeighborLink
 from sumo_agents.safety.validator import HARD_CONSTRAINTS, NoAction, TlsState
+from sumo_agents.sim.actuators import DEFAULT_VMS_COMPLIANCE_RATE
 from sumo_agents.sim.state import JunctionSnapshot
 
 # The model's actual decision for a coalition reply is just "which of the 5
@@ -110,8 +111,30 @@ anti-oscillation, same idea as everywhere else in this system. Yellow \
 ({yellow_s}s, fixed) and all-red ({all_red_s}s, fixed) phases can never be \
 touched.
   - request_vms(edge, alt_route, duration_s): ask for a variable-message- \
-sign detour onto a real edge; alt_route must not revisit an edge (no \
-routing loops).
+sign detour away from a real edge feeding your junction. `edge` must be \
+one of your own incoming_edges (listed below each cycle, together with \
+each edge's CURRENT mean speed vs. its own speed limit) -- only THOSE \
+edges are edges you actually have any real basis to judge. `alt_route` \
+must not revisit an edge (no routing loops), but is not a turn-by-turn \
+path the system guarantees to follow -- it only proves you have a real \
+detour in mind, not just the ask to move traffic somewhere you can't \
+justify. Only some vehicles will actually comply (drivers do not all obey \
+a sign just because it exists -- expect roughly {vms_compliance_rate_pct} \
+of the ones physically capable of rerouting to divert, not all of them), \
+so this is a partial mitigation, not a guaranteed fix.
+
+Use request_vms ONLY on an incoming_edge explicitly marked "[near-stopped \
+for several cycles running]" below -- that flag already means its own \
+speed has stayed far below ITS OWN speed limit across multiple recent \
+decision cycles in a row (a real blockage, e.g. an incident or a stalled \
+vehicle), not a single momentary reading (a vehicle simply waiting out \
+one red light on a short approach edge reads near-0 too, but clears on \
+the next green -- that alone never earns the flag). Do not use request_vms \
+just because you judge an edge's raw numbers "look slow" yourself; wait \
+for the flag. A high queue_len/mean_waiting_s at your junction with NO \
+edge flagged is a signal-timing problem instead (use set_green_bounds) -- \
+vehicles arriving and moving normally, just needing more green time, not \
+a blocked road.
   - no_action: propose nothing this cycle.
 
 `no_action` is fully valid and often the BEST choice. Every proposal is \
@@ -128,6 +151,14 @@ because it fights the actuated engine's own moment-to-moment judgment \
 instead of complementing it. Only propose a change when the observed \
 pattern clearly and persistently justifies it -- a single noisy reading \
 is not enough justification on its own.
+
+Note: a bound you set is not permanent. If you stop reinforcing it (you \
+propose no_action, or act on a different phase instead), it passively \
+relaxes back toward the default [{min_green_s}, {max_green_s}]s by a few \
+seconds every cycle on its own -- you do not need to manually undo a \
+change once the situation that justified it has passed. If you want it \
+back to normal FASTER than that passive rate, you can still set it back \
+yourself explicitly.
 
 ## Coalition round
 
@@ -174,6 +205,7 @@ def _build_system_prompt(junction_id: str, neighbor_ids: list[str]) -> str:
         junction_id=junction_id,
         neighbor_ids=neighbor_text,
         untrusted_data_notice=UNTRUSTED_DATA_SYSTEM_NOTICE,
+        vms_compliance_rate_pct=f"{DEFAULT_VMS_COMPLIANCE_RATE:.0%}",
         **HARD_CONSTRAINTS,
     )
 
@@ -235,16 +267,79 @@ def _build_per_phase_text(per_phase: dict[str, dict[str, float | int]]) -> str:
     ) + "\n"
 
 
+# Below this speed_ratio (current mean speed / the edge's own speed
+# limit), an incoming_edge counts toward a possible real blockage --
+# STEPS.md Step 19 follow-up: a real run found the model never considering
+# request_vms even while recording mean_speed_mps=0.0 for several
+# consecutive cycles at the junction next to a real incident, because it
+# had no per-edge signal to attribute that to the ROAD rather than to
+# signal timing. Chosen well above SUMO's own ~0.1 m/s "halting" threshold
+# (sim/incidents.py's incident speed_factor=0.005 already aims for that)
+# so a genuinely blocked edge is flagged clearly, not marginally.
+_EDGE_NEAR_STOPPED_SPEED_RATIO = 0.15
+
+# A single low reading is NOT enough to flag an edge -- STEPS.md Step 19
+# follow-up #2: the first version of this flag (single instantaneous
+# reading, no history) fired mostly on ordinary red-light queuing at tiny
+# (5-6m) stop-line approach edges, not real incidents -- verified on a
+# real run: 29/37 request_vms proposals fell OUTSIDE the actual scheduled
+# incident window, concentrated on 2 such short edges. A queue waiting at
+# a red light clears on the next green within one signal cycle (well
+# under 90s); a genuine incidents.yaml incident lasts 600s. Requiring the
+# edge to read below the ratio threshold on EVERY one of the last N
+# decision cycles (not just an average, and not just the current one)
+# means an edge must be near-stopped for roughly N * CONTROL_INTERVAL_S
+# straight before it counts -- same "a single noisy reading is not enough
+# justification" principle the system prompt already states for
+# queue_len/mean_waiting_s (`_build_trend_text`), just applied here too.
+_EDGE_NEAR_STOPPED_MIN_CONSECUTIVE_CYCLES = 3
+
+
+def _is_near_stopped(current_ratio: float, past_ratios: list[float]) -> bool:
+    recent = (past_ratios + [current_ratio])[-_EDGE_NEAR_STOPPED_MIN_CONSECUTIVE_CYCLES:]
+    return len(recent) >= _EDGE_NEAR_STOPPED_MIN_CONSECUTIVE_CYCLES and all(
+        r < _EDGE_NEAR_STOPPED_SPEED_RATIO for r in recent
+    )
+
+
+def _build_incoming_edges_text(
+    incoming_edges: tuple[str, ...] | None,
+    edge_conditions: dict[str, dict[str, float]] | None = None,
+    edge_ratio_history: dict[str, list[float]] | None = None,
+) -> str:
+    if not incoming_edges:
+        return ""
+    edge_conditions = edge_conditions or {}
+    edge_ratio_history = edge_ratio_history or {}
+    parts = []
+    for edge_id in incoming_edges:
+        cond = edge_conditions.get(edge_id)
+        if cond is None:
+            parts.append(edge_id)
+            continue
+        near_stopped = _is_near_stopped(cond["speed_ratio"], edge_ratio_history.get(edge_id, []))
+        flag = " [near-stopped for several cycles running -- possible blockage on this road]" if near_stopped else ""
+        parts.append(f"{edge_id} ({cond['mean_speed_mps']:.1f}/{cond['speed_limit_mps']:.1f}m/s){flag}")
+    return (
+        "incoming_edges (only valid `edge` values for request_vms), with current mean speed vs. each "
+        "edge's own speed limit: " + ", ".join(parts) + "\n"
+    )
+
+
 def _build_user_prompt(
     snapshot: JunctionSnapshot,
     tls_state: TlsState,
     sim_time: float,
     history: list[JunctionSnapshot] | None = None,
     per_phase: dict[str, dict[str, float | int]] | None = None,
+    incoming_edges: tuple[str, ...] | None = None,
+    edge_conditions: dict[str, dict[str, float]] | None = None,
+    edge_ratio_history: dict[str, list[float]] | None = None,
 ) -> str:
     return (
         _build_own_state_text(snapshot, tls_state, sim_time)
         + _build_per_phase_text(per_phase or {})
+        + _build_incoming_edges_text(incoming_edges, edge_conditions, edge_ratio_history)
         + _build_trend_text(history or [])
     )
 
@@ -301,10 +396,40 @@ class JunctionAgent:
         # section now mentions the real distance/travel-time a `reply()`
         # call is given for the sender, so the model can weigh how soon a
         # neighbor's situation could actually reach it.
+        # v8: Step 18 follow-up -- told the model a green bound it set now
+        # passively decays back toward default on its own
+        # (safety/validator.py's decay_green_bounds) after real
+        # verification on mixed_district/osm_real found a ratcheting bound
+        # that never came back down measured WORSE than the `fixed`
+        # baseline on both new networks.
+        # v9: Step 19 -- request_vms is now actually applied to TraCI
+        # (sim/actuators.py's _apply_request_vms), so the system prompt's
+        # description of it changed from a placeholder to real constraints:
+        # `edge` must be one of this junction's own incoming_edges (now
+        # given in the user prompt every cycle), and compliance is partial
+        # (DEFAULT_VMS_COMPLIANCE_RATE), not guaranteed.
+        # v10: Step 19 follow-up -- 3 real full-hour runs (post-v9) found
+        # request_vms proposed ZERO times out of 814 decisions, even next
+        # to a real scheduled incident where mean_speed_mps read 0.0 for
+        # several consecutive cycles: the model had no way to attribute
+        # that to the road itself rather than signal timing (queue_len/
+        # mean_waiting_s/mean_speed_mps are all phase-level, ambiguous
+        # between the two). Prompt now also gives each incoming_edge's own
+        # current speed vs. its speed limit, with explicit guidance on
+        # which cause justifies request_vms vs. set_green_bounds.
+        # v11: Step 19 follow-up #2 -- the v10 flag used a single
+        # instantaneous reading with no history, and a real run found it
+        # fired mostly on ordinary red-light queuing at tiny (5-6m)
+        # stop-line approach edges (29/37 request_vms proposals fell
+        # OUTSIDE the actual incident window). The flag now requires the
+        # edge to read near-stopped on EVERY one of the last several
+        # decision cycles in a row before it appears at all, and the
+        # prompt tells the model to rely on the flag text itself rather
+        # than eyeballing raw numbers.
         # Bump the version whenever the system prompt text itself changes
         # (agents/llm.py's docstring), since a stale cache_key would just
         # miss the cache, not error.
-        self._cache_key = f"junction:{junction_id}:v7"
+        self._cache_key = f"junction:{junction_id}:v11"
 
     async def observe(
         self,
@@ -314,6 +439,9 @@ class JunctionAgent:
         *,
         history: list[JunctionSnapshot] | None = None,
         per_phase: dict[str, dict[str, float | int]] | None = None,
+        incoming_edges: tuple[str, ...] | None = None,
+        edge_conditions: dict[str, dict[str, float]] | None = None,
+        edge_ratio_history: dict[str, list[float]] | None = None,
         client: AsyncOpenAI | None = None,
     ) -> tuple[Proposal, Usage]:
         """Round 1: self-assessment only. Always returns a valid `Proposal`
@@ -323,8 +451,18 @@ class JunctionAgent:
         `ask()` itself). `history`: this junction's own snapshots from its
         last few decision cycles, oldest first, NOT including `snapshot`
         itself -- see `_build_trend_text`. `per_phase`: queue/wait broken
-        down by GREEN phase_id -- see `_build_per_phase_text`."""
-        user = _build_user_prompt(snapshot, tls_state, sim_time, history, per_phase)
+        down by GREEN phase_id -- see `_build_per_phase_text`. `incoming_edges`:
+        real edge IDs feeding this junction (STEPS.md Step 19), the only
+        valid `edge` values for a `request_vms` proposal. `edge_conditions`:
+        each of those edges' current speed vs. its own speed limit (STEPS.md
+        Step 19 follow-up). `edge_ratio_history`: each of those edges' past
+        few speed_ratio readings, oldest first, NOT including the current
+        one in `edge_conditions` (STEPS.md Step 19 follow-up #2) -- required
+        for the "near-stopped" flag to mean SUSTAINED, not one noisy
+        reading. See `_build_incoming_edges_text`."""
+        user = _build_user_prompt(
+            snapshot, tls_state, sim_time, history, per_phase, incoming_edges, edge_conditions, edge_ratio_history
+        )
         parsed, usage = await ask(
             "junction", self._system, user, Proposal, cache_key=self._cache_key, client=client
         )

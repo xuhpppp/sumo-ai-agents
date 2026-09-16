@@ -33,6 +33,7 @@ import time
 import uuid
 from pathlib import Path
 
+import yaml
 from sqlalchemy import func, select
 
 from sumo_agents.agents.junction import JunctionAgent
@@ -57,9 +58,18 @@ from sumo_agents.safety.validator import (
     SetGreenBounds,
     SetOffset,
     TlsState,
+    decay_green_bounds,
     validate,
 )
-from sumo_agents.sim.actuators import apply_action, per_phase_traffic, phase_lane_groups, read_tls_state
+from sumo_agents.sim.actuators import (
+    apply_action,
+    edge_speed_limits,
+    incoming_edge_conditions,
+    incoming_edges,
+    per_phase_traffic,
+    phase_lane_groups,
+    read_tls_state,
+)
 from sumo_agents.sim.conn import Backend, SumoConnection
 from sumo_agents.sim.incidents import IncidentInjector, load_incident_schedule
 from sumo_agents.sim.state import JunctionSnapshot, collect_state, traffic_light_ids
@@ -97,14 +107,15 @@ NETWORKS_DIR = Path(__file__).resolve().parents[3] / "networks"
 _SUMOCFG_BY_MODE: dict[str, str] = {"actuated": "sim_actuated.sumocfg", "llm": "sim_actuated.sumocfg"}
 _DEFAULT_SUMOCFG = "sim.sumocfg"
 
-# The 4-6 signalized junctions that get an LLM JunctionAgent in mode="llm"
-# (plan section 2: "4-6 la tran thuc dung" -- cost/latency scale with
-# n_agents). Same 2x3 connected block used throughout Steps 12/13's
-# verification scripts, so their neighbor relationships (agents/topology.py)
-# are meaningful, not arbitrary. Every other signalized junction runs SUMO's
-# own actuated logic, unmanaged by any agent -- same as the `actuated`
-# baseline treats the whole network.
-LLM_AGENT_JUNCTIONS = ["B0", "B1", "B2", "C0", "C1", "C2"]
+def _load_agent_junctions(path: Path) -> list[str]:
+    """Which signalized junctions get an LLM JunctionAgent in mode="llm" --
+    per-scenario (`networks/<scenario>/agent_junctions.yaml`), NOT a global
+    constant, since node IDs are scenario-specific (grid_4x4's B0/B1/...
+    naming means nothing in mixed_district/osm_real, STEPS.md Step 18).
+    Deliberately a small explicit list rather than "every traffic light" --
+    cost/latency scale with n_agents (plan section 2: "4-6 la tran thuc
+    dung"), and osm_real in particular can have far more signals than that."""
+    return yaml.safe_load(path.read_text())
 
 
 def make_controller(mode: str, conn: SumoConnection) -> Controller:
@@ -276,6 +287,9 @@ async def _run_llm_decision_cycle(
     history: dict[str, list[JunctionSnapshot]] | None = None,
     per_phase: dict[str, dict[str, dict[str, float | int]]] | None = None,
     neighbor_links: dict[str, dict[str, NeighborLink]] | None = None,
+    agent_incoming_edges: dict[str, tuple[str, ...]] | None = None,
+    agent_edge_conditions: dict[str, dict[str, dict[str, float]]] | None = None,
+    agent_edge_ratio_history: dict[str, dict[str, list[float]]] | None = None,
 ) -> list[CycleDecision]:
     """Round 1 (observe, parallel -- STEPS.md Step 12) + rounds 2-4
     (agents/orchestrator.py, Step 13), together as ONE background task --
@@ -285,13 +299,32 @@ async def _run_llm_decision_cycle(
     `per_phase`: each junction's queue/wait broken down by green phase_id
     (STEPS.md Step 14 follow-up #2). `neighbor_links`: real distance/
     travel-time between adjacent junctions (STEPS.md Step 14
-    coordination-context follow-up)."""
+    coordination-context follow-up). `agent_incoming_edges`: each junction's
+    real feeding edge IDs (STEPS.md Step 19 -- `actuators.incoming_edges`),
+    so the model has real edge IDs to reference in `request_vms`.
+    `agent_edge_conditions`: each of those edges' current speed vs. its own
+    speed limit (STEPS.md Step 19 follow-up -- `actuators.
+    incoming_edge_conditions`), the signal that tells "this road is
+    blocked" apart from "the signal needs retiming". `agent_edge_ratio_history`:
+    each of those edges' past few speed_ratio readings (STEPS.md Step 19
+    follow-up #2), required for that signal to mean SUSTAINED rather than
+    one noisy reading."""
     history = history or {}
     per_phase = per_phase or {}
+    agent_incoming_edges = agent_incoming_edges or {}
+    agent_edge_conditions = agent_edge_conditions or {}
+    agent_edge_ratio_history = agent_edge_ratio_history or {}
     observe_results = await asyncio.gather(
         *(
             agents[jid].observe(
-                snapshots[jid], tls_states[jid], sim_time, history=history.get(jid), per_phase=per_phase.get(jid)
+                snapshots[jid],
+                tls_states[jid],
+                sim_time,
+                history=history.get(jid),
+                per_phase=per_phase.get(jid),
+                incoming_edges=agent_incoming_edges.get(jid),
+                edge_conditions=agent_edge_conditions.get(jid),
+                edge_ratio_history=agent_edge_ratio_history.get(jid),
             )
             for jid in agents
         )
@@ -331,6 +364,66 @@ async def _run_llm_decision_cycle(
     )
 
 
+async def _decay_green_bounds_for_cycle(
+    conn: SumoConnection,
+    store: Store,
+    run_id: uuid.UUID,
+    cycle_id: int,
+    sim_time: float,
+    llm_agent_junctions: list[str],
+    agent_tls_states: dict[str, TlsState],
+) -> None:
+    """Passively relax every LLM-controlled junction's green bounds toward
+    the default, every control interval, regardless of what the agent
+    itself decides this cycle -- see `safety/validator.py`'s
+    `decay_green_bounds` docstring for why (STEPS.md Step 18 follow-up:
+    without this, a bound an agent raised in response to real congestion
+    never comes back down once conditions improve, which measured WORSE
+    than the naive `fixed` baseline on mixed_district/osm_real).
+
+    Applied synchronously and immediately (unlike an agent's own decision,
+    which only actually reaches TraCI once its background task finishes)
+    -- decide-time and apply-time are the same instant here, so
+    `applied_sim_time == sim_time`. Still logged via `store.add_decision`
+    (not just pushed to TraCI directly) so STEPS.md Step 17's `--replay`
+    reproduces it too -- `--replay`'s whole premise is that `decisions`
+    captures every TraCI-changing action mode="llm" ever takes; silently
+    bypassing that here would make a future replay of a run built on this
+    diverge from what actually happened. `supervisor_verdict`/`_reason`
+    mark it as automatic (no LLM/coalition/supervisor call was made) while
+    still reading as "approved" on the dashboard rather than a blank/null
+    that could be misread as "rejected before reaching supervisor"."""
+    for jid in llm_agent_junctions:
+        tls_state = agent_tls_states[jid]
+        for action in decay_green_bounds(tls_state):
+            # Always within-bounds and moving strictly toward the safe
+            # default by construction (see decay_green_bounds's docstring)
+            # -- validate() is defense-in-depth here, not load-bearing.
+            result = validate(action, tls_state)
+            final_action = result.clamped_action
+            await store.add_decision(
+                run_id=run_id,
+                sim_time=sim_time,
+                cycle_id=cycle_id,
+                junction_id=jid,
+                action_type=action.type,
+                params=action.model_dump(exclude={"type", "junction_id"}),
+                validator_status="ok" if result.ok and not result.violations else ("clamped" if result.ok else "rejected"),
+                validator_violations={"violations": result.violations} if result.violations else None,
+                supervisor_verdict="approved" if final_action is not None else None,
+                supervisor_reason="Automatic passive decay toward default green bounds (STEPS.md Step 18 "
+                "follow-up) -- no LLM/coalition/supervisor call made this cycle.",
+                applied=final_action is not None,
+                final_action_type=final_action.type if final_action is not None else None,
+                final_action_params=final_action.model_dump(exclude={"type", "junction_id"})
+                if final_action is not None
+                else None,
+                applied_sim_time=sim_time if final_action is not None else None,
+            )
+            if final_action is not None:
+                apply_action(conn, final_action)
+
+
 async def _apply_llm_decisions(
     conn: SumoConnection,
     store: Store,
@@ -356,9 +449,12 @@ async def _apply_llm_decisions(
         try:
             apply_action(conn, d.final_action)
         except NotImplementedError as exc:
-            # request_vms only, for now -- STEPS.md Step 19. Recorded, not
-            # silently dropped: the dashboard should be able to show "the
-            # pipeline approved this but it wasn't physically applied yet".
+            # Defense-in-depth for any future action type not yet wired up
+            # here (none currently -- every ActionUnion member, including
+            # `request_vms` since STEPS.md Step 19, is implemented).
+            # Recorded, not silently dropped: the dashboard should be able
+            # to show "the pipeline approved this but it wasn't physically
+            # applied".
             await store.update_decision(d.decision_id, applied=False, effect={"note": str(exc)})
             continue
         await store.update_decision(
@@ -405,6 +501,7 @@ async def run(
 
     incidents = load_incident_schedule(incidents_path) if incidents_path.exists() else []
     injector = IncidentInjector(incidents)
+    llm_agent_junctions = _load_agent_junctions(scenario_dir / "agent_junctions.yaml") if is_llm_mode else []
 
     async with Store(session_factory) as store:
         run_id = await store.create_run(
@@ -416,7 +513,7 @@ async def run(
                 "metric_sample_interval_s": METRIC_SAMPLE_INTERVAL_S,
                 "control_interval_s": CONTROL_INTERVAL_S,
                 "n_incidents": len(incidents),
-                "llm_agent_junctions": LLM_AGENT_JUNCTIONS if is_llm_mode else None,
+                "llm_agent_junctions": llm_agent_junctions if is_llm_mode else None,
                 "replay_of": str(replay_of) if replay_of is not None else None,
             },
         )
@@ -444,7 +541,7 @@ async def run(
         # clock to reach their recorded `applied_sim_time` -- see
         # `_replay_decision_cycle`/`_apply_due_replay_actions`.
         pending_replay_applies: list[_PendingReplayApply] = []
-        time_since_last_green: dict[str, dict[str, float]] = {jid: {} for jid in LLM_AGENT_JUNCTIONS}
+        time_since_last_green: dict[str, dict[str, float]] = {jid: {} for jid in llm_agent_junctions}
         # Per-junction trend history for JunctionAgent.observe() (STEPS.md
         # Step 14 follow-up): a real full-hour run found the model staying
         # passive through real congestion because each observe() call only
@@ -454,8 +551,13 @@ async def run(
         # last SNAPSHOT_HISTORY_LEN decision-cycle snapshots (not 10s metric
         # samples -- the model's own complaint was about cycles, not noise
         # within one).
-        snapshot_history: dict[str, list[JunctionSnapshot]] = {jid: [] for jid in LLM_AGENT_JUNCTIONS}
+        snapshot_history: dict[str, list[JunctionSnapshot]] = {jid: [] for jid in llm_agent_junctions}
         SNAPSHOT_HISTORY_LEN = 3
+        # Per-(junction, edge) speed_ratio history (STEPS.md Step 19
+        # follow-up #2): junction.py's "near-stopped" flag requires the
+        # ratio to stay low across several consecutive cycles, not one --
+        # same SNAPSHOT_HISTORY_LEN window, maintained the same way.
+        edge_ratio_history: dict[str, dict[str, list[float]]] = {jid: {} for jid in llm_agent_junctions}
         n_skipped_cycles = 0
         # Measured empirically (STEPS.md Step 14): an unthrottled libsumo run
         # of this scenario reaches sim_time=3600s+ in ~3-4 REAL seconds --
@@ -476,19 +578,39 @@ async def run(
             conn.start(sumo_cfg, seed=seed)
             junction_ids = traffic_light_ids(conn)
             if is_llm_mode and replay_source is None:
+                missing = [jid for jid in llm_agent_junctions if jid not in junction_ids]
+                if missing:
+                    raise ValueError(
+                        f"agent_junctions.yaml for scenario {scenario!r} lists junction(s) not found in "
+                        f"the loaded network: {missing} (available: {sorted(junction_ids)})"
+                    )
                 # Same lane/link topology as net.xml (netconvert only
                 # changed tls.default-type) -- read from the actuated file
                 # for consistency with what `conn` actually has loaded.
                 llm_neighbor_map = signalized_neighbor_map(scenario_dir / "net_actuated.xml")
                 llm_neighbor_links = neighbor_links(scenario_dir / "net_actuated.xml")
-                llm_agents = {jid: JunctionAgent(jid, llm_neighbor_map[jid]) for jid in LLM_AGENT_JUNCTIONS}
+                llm_agents = {jid: JunctionAgent(jid, llm_neighbor_map[jid]) for jid in llm_agent_junctions}
                 supervisor = SupervisorAgent()
                 controller_observe = None
                 # Link/lane topology per junction never changes over a run
                 # (STEPS.md Step 14 follow-up #2, same reasoning as
                 # MaxPressureController's own `_movements` cache) -- build
                 # once, reuse every decision cycle.
-                llm_phase_lane_groups = {jid: phase_lane_groups(conn, jid) for jid in LLM_AGENT_JUNCTIONS}
+                llm_phase_lane_groups = {jid: phase_lane_groups(conn, jid) for jid in llm_agent_junctions}
+                # STEPS.md Step 19: real edge IDs feeding each agent junction,
+                # so JunctionAgent has actual network vocabulary to reference
+                # in request_vms(edge=...) instead of none at all. Same
+                # "compute once, reuse every cycle" reasoning as the lane
+                # groups above -- the network topology never changes mid-run.
+                llm_incoming_edges = {jid: incoming_edges(conn, groups) for jid, groups in llm_phase_lane_groups.items()}
+                # STEPS.md Step 19 follow-up: each edge's NOMINAL speed
+                # limit, read here (sim_time is still 0, no incident has
+                # started yet) rather than live every cycle -- see
+                # actuators.edge_speed_limits's docstring for why reading
+                # it live would be wrong once an incident is active.
+                llm_edge_speed_limits = {
+                    jid: edge_speed_limits(conn, edges) for jid, edges in llm_incoming_edges.items()
+                }
             elif is_llm_mode:
                 # Replay mode (STEPS.md Step 17): no live agents/supervisor
                 # at all -- every decision cycle is read back from
@@ -547,7 +669,7 @@ async def run(
                         # hour-long agent run). Cheap: pure TraCI reads, no
                         # LLM/network involved. Not needed in replay mode --
                         # nothing calls validate()/observe() again there.
-                        for jid in LLM_AGENT_JUNCTIONS:
+                        for jid in llm_agent_junctions:
                             current_phase = str(snapshots[jid].current_phase)
                             tracked = time_since_last_green[jid]
                             for phase in read_tls_state(conn, jid).phases:
@@ -579,25 +701,56 @@ async def run(
                                 )
                             pending_effect.clear()
 
+                            # Read fresh regardless of `pending_task` status --
+                            # decay (below) runs every control interval, not
+                            # only when a new decision cycle is about to be
+                            # dispatched.
+                            agent_tls_states = {
+                                jid: read_tls_state(conn, jid, time_since_last_green_s=time_since_last_green[jid])
+                                for jid in llm_agent_junctions
+                            }
+                            await _decay_green_bounds_for_cycle(
+                                conn, store, run_id, cycle_id, sim_time, llm_agent_junctions, agent_tls_states
+                            )
+                            # Re-read post-decay -- if pending_task is None
+                            # below, the LLM's own validate() call must see
+                            # TraCI's true current bounds, not the pre-decay
+                            # snapshot above.
+                            agent_tls_states = {
+                                jid: read_tls_state(conn, jid, time_since_last_green_s=time_since_last_green[jid])
+                                for jid in llm_agent_junctions
+                            }
+
                             if pending_task is None:
-                                agent_snapshots = {jid: snapshots[jid] for jid in LLM_AGENT_JUNCTIONS}
-                                agent_tls_states = {
-                                    jid: read_tls_state(
-                                        conn, jid, time_since_last_green_s=time_since_last_green[jid]
-                                    )
-                                    for jid in LLM_AGENT_JUNCTIONS
-                                }
+                                agent_snapshots = {jid: snapshots[jid] for jid in llm_agent_junctions}
                                 # Snapshot BEFORE appending this cycle's own
                                 # reading -- history must never include the
                                 # observation the model is being asked about.
-                                agent_history = {jid: list(snapshot_history[jid]) for jid in LLM_AGENT_JUNCTIONS}
-                                for jid in LLM_AGENT_JUNCTIONS:
+                                agent_history = {jid: list(snapshot_history[jid]) for jid in llm_agent_junctions}
+                                for jid in llm_agent_junctions:
                                     snapshot_history[jid].append(agent_snapshots[jid])
                                     del snapshot_history[jid][:-SNAPSHOT_HISTORY_LEN]
                                 agent_per_phase = {
                                     jid: per_phase_traffic(conn, llm_phase_lane_groups[jid])
-                                    for jid in LLM_AGENT_JUNCTIONS
+                                    for jid in llm_agent_junctions
                                 }
+                                agent_edge_conditions = {
+                                    jid: incoming_edge_conditions(
+                                        conn, llm_incoming_edges[jid], llm_edge_speed_limits[jid]
+                                    )
+                                    for jid in llm_agent_junctions
+                                }
+                                # Same "snapshot BEFORE appending this
+                                # cycle's own reading" rule as snapshot_history
+                                # above (STEPS.md Step 19 follow-up #2).
+                                agent_edge_ratio_history = {
+                                    jid: {e: list(edge_ratio_history[jid].get(e, [])) for e in llm_incoming_edges[jid]}
+                                    for jid in llm_agent_junctions
+                                }
+                                for jid in llm_agent_junctions:
+                                    for e, cond in agent_edge_conditions[jid].items():
+                                        edge_ratio_history[jid].setdefault(e, []).append(cond["speed_ratio"])
+                                        del edge_ratio_history[jid][e][:-SNAPSHOT_HISTORY_LEN]
                                 pending_task = asyncio.create_task(
                                     _run_llm_decision_cycle(
                                         llm_agents,
@@ -612,6 +765,9 @@ async def run(
                                         history=agent_history,
                                         per_phase=agent_per_phase,
                                         neighbor_links=llm_neighbor_links,
+                                        agent_incoming_edges=llm_incoming_edges,
+                                        agent_edge_conditions=agent_edge_conditions,
+                                        agent_edge_ratio_history=agent_edge_ratio_history,
                                     )
                                 )
                                 pending_task_snapshots = agent_snapshots

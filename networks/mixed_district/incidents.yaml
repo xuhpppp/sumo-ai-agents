@@ -1,0 +1,32 @@
+# Seeded incident schedule for the mixed_district scenario (STEPS.md Step 18,
+# mirrors networks/grid_4x4/incidents.yaml's shape/rationale from Step 5).
+#
+# Fixed ahead of time, independent of --seed: every controller mode being
+# compared (fixed / actuated / maxpressure / llm) sees this exact schedule,
+# so differences in the results reflect the controller, not luck.
+#
+# edge_id       : an internal edge (see net.xml) -- every lane on it gets
+#                 slowed down for the duration. Edges "3"/"-3" connect
+#                 junctions 1<->2, both signalized and both inside
+#                 agent_junctions.yaml's cluster, so the incident is
+#                 actually visible to the coordination logic under test.
+# begin/duration: sim seconds.
+# speed_factor  : fraction of each lane's normal max speed while active.
+#                 MUST bring absolute speed below SUMO's fixed 0.1 m/s
+#                 "halting" threshold (used by getLastStepHaltingNumber AND
+#                 vehicle waiting-time accumulation) or the incident won't
+#                 register as a queue/wait-time increase at all -- it'll
+#                 just look like mild travel-time delay. On this network
+#                 (13.89 m/s = 50 km/h edges) that means speed_factor well
+#                 under 0.1/13.89 =~ 0.0072; 0.005 -> ~0.07 m/s (same
+#                 numbers as grid_4x4, same network speed class).
+
+- edge_id: "3"
+  begin: 1200
+  duration: 600
+  speed_factor: 0.005
+
+- edge_id: "-3"
+  begin: 1200
+  duration: 600
+  speed_factor: 0.005

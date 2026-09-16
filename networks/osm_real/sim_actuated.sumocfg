@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  osm_real — "actuated" baseline variant (mirrors grid_4x4/sim_actuated.sumocfg,
+  STEPS.md Step 8/18). Map data is (c) OpenStreetMap contributors, ODbL;
+  see ATTRIBUTION.md in this directory before redistributing
+  net_actuated.xml outside this repo.
+
+  Identical to sim.sumocfg (same edges/junctions/demand/incidents) except
+  net-file: net_actuated.xml has every junction's tlLogic type="static"
+  converted to type="actuated" (SUMO's built-in gap-based controller),
+  generated once via netconvert with: sumo-net-file=net.xml, tls.rebuild,
+  tls.default-type=actuated, tls.min-dur=7, tls.max-dur=90,
+  output=net_actuated.xml.
+
+  min-dur/max-dur match HARD_CONSTRAINTS["min_green_s"/"max_green_s"] in
+  safety/validator.py, same reasoning as grid_4x4: a fair comparison
+  against whatever green-time bounds an LLM/maxpressure agent is allowed
+  to use.
+-->
+<sumoConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+    <input>
+        <net-file value="net_actuated.xml"/>
+        <route-files value="trips.xml"/>
+    </input>
+
+    <time>
+        <begin value="0"/>
+        <end value="3600"/>
+        <step-length value="1"/>
+    </time>
+
+    <processing>
+        <device.rerouting.probability value="1.0"/>
+    </processing>
+
+</sumoConfiguration>

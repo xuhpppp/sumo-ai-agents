@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  osm_real — real-street-network scenario (see IMPLEMENTATION_PLAN.md §4;
+  STEPS.md Step 18). A small block of the Hoàn Kiếm district, Hanoi,
+  Vietnam, converted from live OpenStreetMap data via the Overpass API and
+  netconvert (with the tls.guess option enabled, since real OSM traffic
+  signal tagging is incomplete/inconsistent; most of this extract's
+  signalized junctions are guessed, not explicitly tagged; see
+  ATTRIBUTION.md for the exact bbox/fetch date/commands).
+
+  Map data is (c) OpenStreetMap contributors, licensed ODbL; see
+  ATTRIBUTION.md in this same directory BEFORE redistributing net.xml or
+  net_actuated.xml outside this repo.
+
+  51 junctions (33 traffic light, 15 priority, 3 boundary dead ends), 91
+  passenger accessible edges. Demand: randomTrips.py, seed=42, period=1.0
+  (see trips.xml generation command in the Step 18 work log), over 3600s.
+
+  Structurally identical to grid_4x4/sim.sumocfg (same time block, same
+  device.rerouting.probability=1.0 for STEPS.md Step 19 VMS support);
+  only net-file differs between the four sumocfg files in this directory
+  family. The seed is intentionally NOT hardcoded here (see
+  grid_4x4/sim.sumocfg's comment for why).
+-->
+<sumoConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+    <input>
+        <net-file value="net.xml"/>
+        <route-files value="trips.xml"/>
+    </input>
+
+    <time>
+        <begin value="0"/>
+        <end value="3600"/>
+        <step-length value="1"/>
+    </time>
+
+    <processing>
+        <device.rerouting.probability value="1.0"/>
+    </processing>
+
+</sumoConfiguration>

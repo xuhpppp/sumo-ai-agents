@@ -1,0 +1,28 @@
+# The signalized junctions that get an LLM JunctionAgent in mode="llm"
+# (sim/runner.py's _load_agent_junctions, STEPS.md Step 18). Chosen as one
+# small, mutually-connected block of 6 signalized junctions (same count as
+# grid_4x4's B0/B1/B2/C0/C1/C2), verified via agents/topology.py's
+# signalized_neighbor_map(net_actuated.xml) -- every junction below has at
+# least one neighbor also in this list, so coordination (set_offset,
+# coalition messages) has real adjacency to act on:
+#   1  -> 2, 6, 8, 18   (all in this list)
+#   2  -> 1, 6, 18, 24  (all in this list)
+#   6  -> 1, 2, 24      (all in this list)
+#   8  -> 1             (junction "1" -- 8 is degree-3, the T-junction)
+#   18 -> 1, 2
+#   24 -> 2, 6
+#
+# NOTE: these node IDs are all-digit, unlike grid_4x4's "B0"/"B1"/... --
+# they MUST be quoted here. sim/runner.py's `_load_agent_junctions` does a
+# bare `yaml.safe_load` with no str() coercion, and an unquoted all-digit
+# YAML scalar parses as an int, which then never matches any sumolib node
+# ID (always a str) -- the same gotcha networks/osm_real/agent_junctions.yaml
+# documents; caught here by directly checking `yaml.safe_load(...)`'s
+# output types against a real `traffic_light_ids(conn)` call rather than
+# trusting a throwaway check script that happened to coerce types.
+- "1"
+- "2"
+- "6"
+- "8"
+- "18"
+- "24"

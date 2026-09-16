@@ -1,0 +1,30 @@
+# Seeded incident schedule for the osm_real scenario (mirrors
+# grid_4x4/incidents.yaml, STEPS.md Step 5/18).
+#
+# Fixed ahead of time, independent of --seed: every controller mode being
+# compared (fixed / actuated / maxpressure / llm) sees this exact schedule,
+# so differences in the results reflect the controller, not luck.
+#
+# edge_id       : a real OSM-derived internal edge (see net.xml) -- both
+#                 directions of the street segment between agent_junctions
+#                 98010042 and 11379754649 (part of the connected chain in
+#                 agent_junctions.yaml), 50 km/h (13.89 m/s) like grid_4x4.
+# begin/duration: sim seconds.
+# speed_factor  : fraction of each lane's normal max speed while active.
+#                 MUST bring absolute speed below SUMO's fixed 0.1 m/s
+#                 "halting" threshold (used by getLastStepHaltingNumber AND
+#                 vehicle waiting-time accumulation) or the incident won't
+#                 register as a queue/wait-time increase at all -- same
+#                 reasoning and same speed_factor=0.005 (-> ~0.07 m/s) as
+#                 grid_4x4/incidents.yaml, since these edges have the same
+#                 13.89 m/s speed limit.
+
+- edge_id: 1223385256#0
+  begin: 1200
+  duration: 600
+  speed_factor: 0.005
+
+- edge_id: -1223385256#0
+  begin: 1200
+  duration: 600
+  speed_factor: 0.005

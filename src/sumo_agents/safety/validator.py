@@ -30,6 +30,12 @@ HARD_CONSTRAINTS = {
     "max_starvation_s": 120,  # every direction must see green within this window
 }
 
+# Passive per-cycle pull back toward [min_green_s, max_green_s]'s default
+# range -- see `decay_green_bounds` below. Deliberately smaller than
+# max_delta_per_cycle_s so an agent's own active push always dominates in
+# the SAME cycle; decay only wins once the agent stops reinforcing a bound.
+GREEN_BOUNDS_DECAY_PER_CYCLE_S = 5
+
 PhaseKind = Literal["green", "yellow", "all_red"]
 
 
@@ -279,6 +285,70 @@ def _validate_set_green_bounds(action: SetGreenBounds, tls_state: TlsState) -> V
         violations=violations,
         clamped_action=action.model_copy(update={"min_green_s": clamped_min, "max_green_s": clamped_max}),
     )
+
+
+def _step_toward(current: float, target: float, step: float) -> float:
+    if current < target:
+        return min(current + step, target)
+    if current > target:
+        return max(current - step, target)
+    return current
+
+
+def decay_green_bounds(
+    tls_state: TlsState, decay_step_s: float = GREEN_BOUNDS_DECAY_PER_CYCLE_S
+) -> list[SetGreenBounds]:
+    """Passively relax every GREEN phase's actuated [min_green_s,
+    max_green_s] a bounded step back toward the network-wide default
+    ([HARD_CONSTRAINTS["min_green_s"], HARD_CONSTRAINTS["max_green_s"]])
+    every decision cycle -- independent of whatever the agent itself
+    decides that cycle.
+
+    Found via real verification on mixed_district/osm_real (STEPS.md Step
+    18 follow-up): an agent that repeatedly raises one phase's
+    min_green_s in response to real, persistent congestion has no
+    built-in reason to ever lower it again once conditions improve --
+    `_validate_set_green_bounds` only clamps the PER-CYCLE delta
+    (max_delta_per_cycle_s), it never decays a cumulative, multi-cycle
+    drift. On grid_4x4's symmetric grid this was tolerable (the starved
+    competing phase there usually carries comparable load); on irregular
+    topologies (T-junctions, a one-way roundabout, real low-degree OSM
+    signals) the SAME ratchet starved a disproportionately important
+    competing movement badly enough that mode="llm" measured WORSE than
+    the naive `fixed` baseline on both new networks -- something that had
+    never happened on grid_4x4. This applies a small, constant per-cycle
+    correction toward the safe default regardless of the agent's own
+    choices, so a bound that stops being actively reinforced returns to
+    neutral within a bounded number of cycles instead of staying stuck at
+    whatever extreme it last reached.
+
+    Returns one SetGreenBounds action per green phase that isn't already
+    at the default (an empty list if every phase already is -- the common
+    case). Safe to apply directly without a separate validate() call: the
+    result is always within [min_green_s, max_green_s] by construction and
+    moves strictly toward the default, never away from it -- callers still
+    running it through `validate()` anyway (as sim/runner.py does) is
+    defense-in-depth, not a requirement.
+    """
+    default_min = HARD_CONSTRAINTS["min_green_s"]
+    default_max = HARD_CONSTRAINTS["max_green_s"]
+    actions: list[SetGreenBounds] = []
+    for phase in tls_state.phases:
+        if phase.kind != "green":
+            continue
+        new_min = _step_toward(phase.min_dur_s, default_min, decay_step_s)
+        new_max = _step_toward(phase.max_dur_s, default_max, decay_step_s)
+        if new_min == phase.min_dur_s and new_max == phase.max_dur_s:
+            continue
+        actions.append(
+            SetGreenBounds(
+                junction_id=tls_state.junction_id,
+                phase_id=phase.phase_id,
+                min_green_s=new_min,
+                max_green_s=new_max,
+            )
+        )
+    return actions
 
 
 def _validate_request_vms(action: RequestVms) -> ValidationResult:

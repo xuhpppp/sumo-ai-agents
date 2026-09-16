@@ -1,0 +1,33 @@
+# The signalized junctions that get an LLM JunctionAgent in mode="llm"
+# (sim/runner.py's _load_agent_junctions, STEPS.md Step 18).
+#
+# Unlike grid_4x4's regular 2x3 block, a real OSM extract does not lay
+# junctions out on a grid: this is a connected CHAIN of 6 real
+# traffic-light nodes along one corridor in the Hoan Kiem extract (see
+# ATTRIBUTION.md for the bbox), picked from the 33 traffic-light nodes in
+# net_actuated.xml by requiring each node to directly share an edge with
+# at least one other node in this list (checked with
+# sumo_agents.agents.topology.signalized_neighbor_map -- see the Step 18
+# work log for the exact check run).
+#
+# 98010042 and 98010040/98012400 are real multi-way vehicle intersections
+# (3 incoming/3 outgoing edges each); 11379754649, 6689685037 and
+# 6689685038 are lower-degree (2-in/2-out) nodes along the same corridor
+# that OSM also tags as highway=traffic_signals -- in this dense part of
+# Hanoi that is very often a genuine mid-block pedestrian-crossing signal
+# rather than a full intersection, not a netconvert artifact. They are
+# still real, separately-signalized nodes a JunctionAgent can legitimately
+# control, so they are kept in the chain rather than filtered out.
+#
+# NOTE: these OSM node IDs are all-digit, unlike grid_4x4's "B0"/"B1"/...
+# -- they MUST be quoted here. sim/runner.py's `_load_agent_junctions`
+# does a bare `yaml.safe_load` with no str() coercion, and an unquoted
+# all-digit YAML scalar parses as an int, which then fails to match any
+# sumolib node ID (always a str) -- confirmed this the hard way while
+# building this scenario (see the Step 18 work log's connectivity check).
+- "98010042"
+- "11379754649"
+- "6689685037"
+- "98010040"
+- "6689685038"
+- "98012400"

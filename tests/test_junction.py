@@ -181,6 +181,87 @@ async def test_observe_omits_per_phase_section_when_not_given() -> None:
     assert "per_phase_queue" not in user_prompt
 
 
+async def test_observe_passes_incoming_edges_into_the_user_prompt() -> None:
+    # STEPS.md Step 19: request_vms(edge=...) is meaningless without the
+    # model knowing any real edge ID -- these are its only valid choices.
+    reply = Proposal(junction_id="B1", action=NoAction(junction_id="B1"), urgency="low", rationale="x")
+    client = _FakeClient(_fake_response(reply))
+    agent = JunctionAgent("B1", ["A1"])
+
+    await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=90.0, incoming_edges=("A1B1", "C1B1"), client=client)
+
+    user_prompt = client.responses.calls[0]["input"][1]["content"]
+    assert "incoming_edges (only valid `edge` values for request_vms)" in user_prompt
+    assert "A1B1, C1B1" in user_prompt
+
+
+async def test_observe_flags_an_edge_near_stopped_for_several_cycles_running() -> None:
+    # STEPS.md Step 19 follow-up #2: a single low reading is NOT enough --
+    # a real run found that flagging on one instantaneous reading fired
+    # mostly on ordinary red-light queuing at short approach edges, not
+    # real incidents. The flag now requires the edge to read near-stopped
+    # on every one of the last few cycles in a row.
+    reply = Proposal(junction_id="B1", action=NoAction(junction_id="B1"), urgency="low", rationale="x")
+    client = _FakeClient(_fake_response(reply))
+    agent = JunctionAgent("B1", ["A1"])
+    edge_conditions = {
+        "A1B1": {"mean_speed_mps": 8.2, "speed_limit_mps": 13.9, "speed_ratio": 8.2 / 13.9},
+        "C1B1": {"mean_speed_mps": 0.1, "speed_limit_mps": 13.9, "speed_ratio": 0.1 / 13.9},
+    }
+    edge_ratio_history = {
+        "A1B1": [0.05, 0.9],  # not consistently low -- must not be flagged
+        "C1B1": [0.02, 0.01],  # low for 2 prior cycles + this one = 3 running
+    }
+
+    await agent.observe(
+        _SNAPSHOT,
+        _TLS_STATE,
+        sim_time=90.0,
+        incoming_edges=("A1B1", "C1B1"),
+        edge_conditions=edge_conditions,
+        edge_ratio_history=edge_ratio_history,
+        client=client,
+    )
+
+    user_prompt = client.responses.calls[0]["input"][1]["content"]
+    assert "A1B1 (8.2/13.9m/s)" in user_prompt
+    assert "near-stopped" not in user_prompt.split("A1B1")[1].split("C1B1")[0]
+    assert "C1B1 (0.1/13.9m/s) [near-stopped for several cycles running -- possible blockage on this road]" in user_prompt
+
+
+async def test_observe_does_not_flag_a_single_low_reading_with_no_history() -> None:
+    # The exact false-positive pattern found on the real run: one
+    # momentary near-0 reading (e.g. a vehicle waiting out one red light)
+    # must NOT be enough on its own.
+    reply = Proposal(junction_id="B1", action=NoAction(junction_id="B1"), urgency="low", rationale="x")
+    client = _FakeClient(_fake_response(reply))
+    agent = JunctionAgent("B1", ["A1"])
+    edge_conditions = {"C1B1": {"mean_speed_mps": 0.0, "speed_limit_mps": 13.9, "speed_ratio": 0.0}}
+
+    await agent.observe(
+        _SNAPSHOT,
+        _TLS_STATE,
+        sim_time=90.0,
+        incoming_edges=("C1B1",),
+        edge_conditions=edge_conditions,
+        client=client,
+    )
+
+    user_prompt = client.responses.calls[0]["input"][1]["content"]
+    assert "near-stopped" not in user_prompt
+
+
+async def test_observe_omits_incoming_edges_section_when_not_given() -> None:
+    reply = Proposal(junction_id="B1", action=NoAction(junction_id="B1"), urgency="low", rationale="x")
+    client = _FakeClient(_fake_response(reply))
+    agent = JunctionAgent("B1", ["A1"])
+
+    await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
+
+    user_prompt = client.responses.calls[0]["input"][1]["content"]
+    assert "incoming_edges" not in user_prompt
+
+
 async def test_observe_falls_back_to_no_action_on_llm_failure() -> None:
     client = _FakeClient(RuntimeError("boom"))
     agent = JunctionAgent("B1", ["A1"])
@@ -267,7 +348,7 @@ async def test_reply_uses_the_same_system_prompt_and_cache_key_as_observe() -> N
     await agent.reply(_INCOMING, _SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
 
     (call,) = client.responses.calls
-    assert call["prompt_cache_key"] == "junction:B1:v7"
+    assert call["prompt_cache_key"] == "junction:B1:v11"
     assert call["input"][0]["content"] == agent._system
 
 
@@ -284,7 +365,7 @@ async def test_observe_passes_cache_key_and_schema_through_to_ask() -> None:
     await agent.observe(_SNAPSHOT, _TLS_STATE, sim_time=90.0, client=client)
 
     (call,) = client.responses.calls
-    assert call["prompt_cache_key"] == "junction:B1:v7"
+    assert call["prompt_cache_key"] == "junction:B1:v11"
     assert call["text_format"] is Proposal
     assert call["model"] == "gpt-5.6-luna"
     assert call["input"][0]["role"] == "system"

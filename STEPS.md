@@ -31,8 +31,8 @@
 | 15 | Backend dashboard + WebSocket | 3 | 3h | ✅ |
 | 16 | 4 panel frontend | 3 | 5h | ✅ |
 | 17 | Chế độ `--replay` | 3 | 2h | ✅ |
-| 18 | Mạng lưới đa dạng (mixed + OSM) | 3 | 3h | ⬜ |
-| 19 | VMS / rerouting + compliance rate | 4 | 3h | ⬜ |
+| 18 | Mạng lưới đa dạng (mixed + OSM) | 3 | 3h | ✅ |
+| 19 | VMS / rerouting + compliance rate | 4 | 3h | ✅ |
 | 20 | Sinh scenario bằng AI | 4 | 3h | ⬜ |
 | 21 | MCP server | 4 | 4h | ⬜ |
 
@@ -616,17 +616,179 @@ python -m sumo_agents.sim.runner --replay <run_id_vừa_chạy>                 
 
 **DoD đạt được**: replay chạy được, **$0** (không gọi OpenAI — xác nhận qua code path, không có import/gọi `agents/llm.py` nào trong nhánh replay), messages/decisions/llm_calls hiển thị **y hệt** run gốc trên dashboard (verify thật, xem trên); quỹ đạo mô phỏng (`metrics`/`mean_travel_time_s`) y hệt **cho run ghi từ nay trở đi** (cơ chế `applied_sim_time`, verify bằng unit test) — với run cũ hơn Bước 17 thì có sai số nhỏ đã đo và giải thích rõ nguyên nhân ở trên, không che giấu.
 
-## Bước 18 · Mạng lưới đa dạng
-`mixed_district` (netgenerate --rand + chỉnh tay: ngã ba T, vòng xuyến, nút lệch) và `osm_real` (osmWebWizard, 1 quận thật).
-**DoD**: cả 3 mạng chạy được cả 4 chế độ · ⚠️ dữ liệu OSM là **ODbL**, xem plan §12.2
+## Bước 18 · Mạng lưới đa dạng ✅
+
+**Mục tiêu**: thêm `mixed_district` (netgenerate --rand + chỉnh tay: ngã ba T, vòng xuyến, nút lệch) và `osm_real` (1 quận thật) bên cạnh `grid_4x4`, cả 3 mạng chạy được cả 4 chế độ.
+
+**Rào cản kiến trúc phát hiện trước khi làm mạng mới**: `sim/runner.py` có `LLM_AGENT_JUNCTIONS = ["B0","B1","B2","C0","C1","C2"]` — hardcode ID nút của riêng `grid_4x4`. `mixed_district`/`osm_real` có ID nút hoàn toàn khác (số nguyên do `netgenerate`, ID kiểu OSM way cho `osm_real`), nên `mode=llm` sẽ vỡ ngay nếu không tổng quát hoá. Đã hỏi ý kiến trước khi làm (không tự đoán): chọn phương án file cấu hình riêng mỗi scenario — `networks/<scenario>/agent_junctions.yaml`, cùng phong cách với `incidents.yaml` đã có.
+
+**Đã làm (`sim/runner.py`)**:
+- Bỏ hằng số toàn cục `LLM_AGENT_JUNCTIONS`, thay bằng `_load_agent_junctions(path) -> list[str]` (đọc YAML) + biến cục bộ `llm_agent_junctions` trong `run()`, nạp từ `scenario_dir / "agent_junctions.yaml"` khi `is_llm_mode`. Mọi chỗ dùng `LLM_AGENT_JUNCTIONS` cũ (7 vị trí: khởi tạo `time_since_last_green`/`snapshot_history`, dựng `JunctionAgent`/`llm_phase_lane_groups`, vòng lặp starvation-tracking, vòng lặp mỗi chu kỳ quyết định) đổi sang biến cục bộ này.
+- Thêm 1 check fail-sớm-rõ-ràng: nếu `agent_junctions.yaml` liệt kê ID không có trong mạng vừa nạp (`traffic_light_ids(conn)`) → `ValueError` liệt kê rõ ID nào thiếu, thay vì lỗi `KeyError` mù mờ giữa vòng lặp.
+- `networks/grid_4x4/agent_junctions.yaml` (mới): `[B0, B1, B2, C0, C1, C2]` — giữ nguyên hành vi cũ 100%.
+- Verify: 138/138 test pass (không test nào đụng `LLM_AGENT_JUNCTIONS` trực tiếp) + chạy thật `--scenario grid_4x4 --mode fixed --seed 42` (miễn phí, tất định) xác nhận refactor không phá gì, dọn sạch Postgres.
+
+**`mixed_district`** (giao cho 1 agent nền dựng, tôi tự verify lại độc lập sau khi xong — không tin báo cáo suông):
+- Sinh bằng `netgenerate --rand` (tham số `neighbor-dist3=0.5`/`neighbor-dist4=0.4` để ép có ngã ba T), rồi **chỉnh tay đúng cách SUMO hỗ trợ** — không gõ tay `net.xml` đã biên dịch (đúng nguyên tắc plan §4 "AI không sinh XML trực tiếp"): xuất ra plain XML (`netconvert --plain-output-prefix`), sửa `plain.nod.xml`/`plain.edg.xml` để thêm 1 vòng xuyến 5 nút (bán kính 25m, cách đều 72°) thay cho 1 nút 5 nhánh cũ, build lại bằng `netconvert --roundabouts.guess --tls.guess`.
+- Verify **độc lập bởi tôi** (không dùng script của agent): `sumolib.net.readNet` xác nhận `net.getRoundabouts()` trả về đúng 1 vòng xuyến (`rr_2, rr_205, rr_266, rr_276, rr_358`); nút `8`/`208`/`24` có `in=3,out=3` (ngã ba T thật, không phải nút cụt biên); nút `1` có 4 nhánh ở góc `56.2°/214.9°/286.8°/337.9°` — không cặp nào gần 180° → không có hướng đi thẳng xuyên qua, đúng đặc điểm "nút lệch" (staggered). 29 nút tổng, 9 nút có đèn tín hiệu (grid_4x4: 16/12 — cùng cấp độ).
+- `agent_junctions.yaml`: `["1","2","6","8","18","24"]`, 1 cụm liên kết với nhau (verify bằng `signalized_neighbor_map`).
+- **Lỗi thật phát hiện khi tôi tự verify lại** (agent báo cáo "PASS" nhưng dùng script tự chế có coerce kiểu, che mất lỗi): file gốc agent viết ghi `- 1` / `- 2` ... **không quote** → `yaml.safe_load` trả về `int`, không phải `str`, trong khi `traffic_light_ids(conn)` luôn trả `str` → `_load_agent_junctions` + check "missing" mới thêm ở trên sẽ báo lỗi **cả 6 nút đều thiếu** ngay khi khởi động `mode=llm`. Cùng gotcha mà agent dựng `osm_real` đã tự phát hiện và tránh (xem dưới), nhưng agent dựng `mixed_district` bỏ sót. Đã tự sửa: quote lại thành chuỗi (`"1"`, `"2"`, ...), verify lại bằng đúng code path thật (`yaml.safe_load` → kiểm tra kiểu → so với `traffic_light_ids(conn)` thật) — pass.
+- Demand: `randomTrips.py -p 1.8` (thử `-p 0.8`/`1.5` trước, drain quá lâu tới sim_time ~7000-9500s — vì điều kiện dừng thật là `getMinExpectedNumber() > 0`, không phải cắt cứng ở t=3600).
+- Chạy thật (agent thực hiện, tôi không lặp lại vì không liên quan tới lỗi vừa sửa — sửa `agent_junctions.yaml` chỉ ảnh hưởng nhánh `is_llm_mode`, baseline không đụng tới): `fixed` 2 lần cùng seed → `final_sim_time=3797.0s` cả 2 lần (tất định); `actuated` → `3746.0s`; `maxpressure` → `3808.0s`; không lỗi fatal. Dọn sạch 8 row test khỏi Postgres, đã tự xác nhận lại 0 row còn sót (`scenario IN ('mixed_district','osm_real')`).
+
+**`osm_real`** (agent nền thứ 2 dựng song song, độc lập với `mixed_district`):
+- Dữ liệu thật qua Overpass API (`curl ".../api/map?bbox=..."`, cần header `User-Agent` tự đặt — mặc định bị `406`), khu vực ~330m×330m ngay Đông Nam hồ Hoàn Kiếm, Hà Nội (bbox thử đầu tiên ngay sát hồ gần như không có nút đèn tín hiệu thật — chủ yếu phố đi bộ/công viên — phải đổi bbox). Dựng bằng `netconvert --osm-files ... --tls.guess true --geometry.remove --roundabouts.guess --keep-edges.by-vclass passenger --remove-edges.isolated` (2 flag cuối phải thêm ngoài dự kiến ban đầu vì OSM thô giữ lại hàng trăm nút vỉa hè/qua đường không phải giao lộ xe thật).
+- **`ATTRIBUTION.md`** (bắt buộc theo plan §12.2 — dữ liệu OSM là ODbL, share-alike): ghi rõ © OpenStreetMap contributors, license ODbL (link), bbox chính xác, ngày tải (2026-09-16), và cảnh báo tường minh: nếu phân phối `net.xml`/`net_actuated.xml`/`map.osm` ra ngoài repo này thì phải tự xác nhận tuân thủ ODbL share-alike trước. `sim.sumocfg`/`sim_actuated.sumocfg` đều trỏ tới file này trong header comment.
+- 51 nút (33 đèn tín hiệu — phần lớn do `--tls.guess` chứ không phải tag OSM gốc, vì OSM thực tế gắn `traffic_signals` khá tùy tiện kể cả cho vạch qua đường giữa phố), 91 cạnh xe chạy được.
+- `agent_junctions.yaml`: `["98010042","11379754649","6689685037","98010040","6689685038","98012400"]` (đã quote sẵn đúng ngay từ đầu — agent này tự phát hiện gotcha int/YAML và ghi hẳn comment giải thích trong file). Verify **độc lập bởi tôi**: nạp bằng `yaml.safe_load` → toàn bộ là `str`; `signalized_neighbor_map(net_actuated.xml)` xác nhận đúng là 1 chuỗi liên kết (mỗi nút có ≥1 hàng xóm cũng nằm trong danh sách).
+- Chạy thật: `fixed` 2 lần cùng seed → `final_sim_time=3740.0s` cả 2 lần; `actuated` → `3737.0s`; `maxpressure` → `3740.0s`; teleport warning chỉ xảy ra đúng khung sự cố 1200-1800s (xác nhận `incidents.yaml` hoạt động đúng). Dọn sạch Postgres, xác nhận 0 row sót.
+- Phát hiện phụ đã tự xử lý: `randomTrips.py --validate` gọi ngầm `duarouter`, làm rơi 1 file `routes.rou.xml` ở gốc repo ngoài `networks/osm_real/` — agent phát hiện và `git checkout -- routes.rou.xml` để revert, tôi xác nhận lại `git status` sạch.
+
+**Kiểm chứng cấu trúc `mode=llm` cho cả 2 mạng mới** (không gọi OpenAI, không cần tôi/agent tự chạy `--mode llm` thật — luôn là việc của bạn): script tạm start `SumoConnection` trên `sim_actuated.sumocfg`, gọi `traffic_light_ids(conn)`, so với `agent_junctions.yaml` — cả 2 mạng đều khớp (không thiếu ID nào) sau khi sửa lỗi quote ở `mixed_district`.
+
+**Test**: 138/138 (không có test mới riêng cho mạng mới — đúng như Bước 3/5/8/14, các file mạng lưới không có unit test, verify bằng chạy thật SUMO như trên).
+
+**Giới hạn minh bạch còn lại**: cả 2 mạng mới **chưa từng chạy `--mode llm` thật** — việc đó luôn dành cho bạn (tốn tiền OpenAI). Tôi chỉ đảm bảo được: (1) mọi thứ tổng quát hoá đúng (không hardcode `grid_4x4`), (2) `agent_junctions.yaml` khớp cấu trúc mạng thật, (3) 3 chế độ baseline chạy sạch/tất định. Chưa biết agent thật sẽ ra quyết định thế nào trên hình học khác (`mixed_district`'s vòng xuyến/nút lệch, `osm_real`'s mật độ đèn dày đặc thật) — đó là điều bạn sẽ quan sát khi chạy `--mode llm` lần đầu trên 2 mạng này:
+```bash
+python -m sumo_agents.sim.runner --scenario mixed_district --mode llm --seed 42
+python -m sumo_agents.sim.runner --scenario osm_real --mode llm --seed 42
+```
+
+**DoD đạt được**: cả 3 mạng (`grid_4x4`/`mixed_district`/`osm_real`) chạy sạch, tất định ở 3 chế độ `fixed`/`actuated`/`maxpressure` (verify thật, số liệu ở trên); wiring cho `mode=llm` đã tổng quát hoá và verify cấu trúc đúng cho cả 3 mạng — xác nhận cuối cùng bằng chạy `llm` thật xin để bạn làm. Cảnh báo ODbL đã xử lý tường minh qua `ATTRIBUTION.md`, không che giấu.
+
+### Follow-up · `llm` thua cả `fixed` trên 2 mạng mới — tìm nguyên nhân + sửa
+
+Bạn tự chạy `--mode llm` thật trên cả 2 mạng mới (seed=42, run `a82523ff` cho `mixed_district`, `dddc0b6d` cho `osm_real`). Kết quả (`mean_travel_time_s`):
+
+| | fixed | actuated | maxpressure | llm |
+|---|---|---|---|---|
+| grid_4x4 (lịch sử, `51a9788c`) | 134.35 | 107.40 | 139.51 | 111.85 |
+| mixed_district | 130.86 | 104.28 | 137.15 | **139.37** |
+| osm_real | 97.92 | 101.65 | 97.92 | **106.04** |
+
+Trên `grid_4x4`, `llm` thua nhẹ `actuated` (~4%) nhưng vẫn thắng rõ `fixed` (~17%) — đúng như ghi nhận ở Bước 14. Trên **cả 2 mạng mới**, `llm` là chế độ **tệ nhất trong 4 — thua cả `fixed` tĩnh** (mixed_district tệ hơn fixed 6.5%, osm_real tệ hơn 8.3%). Khác về CHẤT, không chỉ về lượng, nên quyết định dừng lại tìm nguyên nhân trước khi sang Bước 19 (theo yêu cầu của bạn).
+
+**Nguyên nhân tìm được** (đọc trực tiếp `decisions.params`/`effect` theo thời gian, không suy đoán): junction hoạt động nhiều nhất ở cả 2 mạng liên tục **kéo tăng dần `min_green_s` cho cùng 1 phase** qua nhiều chu kỳ liên tiếp, mỗi lần đúng bằng `max_delta_per_cycle_s=15` — ví dụ `mixed_district` nút "2" phase "4": 30→45→60→75 (trần `max_green_s=90`, gần như chiếm trọn chu kỳ); `osm_real` nút chính tương tự 22→30→45→60. Kiểm tra lại thì **thấy đúng pattern này cũng có sẵn trong chính run tốt nhất của `grid_4x4`** (B1 phase 0: 22→37→52...) — không phải lỗi mới sinh ra từ mạng mới. Nguyên nhân gốc: `safety/validator.py`'s `_validate_set_green_bounds` chỉ giới hạn delta MỖI CHU KỲ (`max_delta_per_cycle_s`), không có cơ chế nào kéo `min_green_s` **giảm trở lại** sau khi tình hình đã cải thiện — một khi agent ngừng tăng, giá trị cứ đứng yên ở mức đã đạt, mãi mãi. Trên lưới đều/đối xứng grid_4x4, ép 1 phase tăng vẫn chỉ "ăn bớt" của phase đối xứng tải tương đương nên chịu được; trên cấu trúc bất thường của 2 mạng mới (ngã ba T, vòng xuyến 1 chiều, nút OSM thật không đều — có nút chỉ phục vụ 2 hướng có thể là đèn qua đường giữa phố), phase bị bỏ đói khi ratchet lên có thể đang phục vụ hướng quan trọng hơn nhiều → thiệt hại không cân xứng, cộng thêm mạng nhỏ hơn (6-9 nút tín hiệu so với 12-36 của grid_4x4) nên tác động cục bộ lan ra toàn mạng rõ hơn nhiều.
+
+**Đã sửa**:
+- `safety/validator.py`: thêm hằng số `GREEN_BOUNDS_DECAY_PER_CYCLE_S=5` (nhỏ hơn `max_delta_per_cycle_s=15` có chủ đích — để agent chủ động đẩy bound luôn thắng thế trong cùng 1 chu kỳ, decay chỉ thắng khi agent ngừng tác động) + hàm thuần `decay_green_bounds(tls_state, decay_step_s=...) -> list[SetGreenBounds]`: mỗi phase GREEN có `min_green_s`/`max_green_s` khác mặc định `[HARD_CONSTRAINTS["min_green_s"], HARD_CONSTRAINTS["max_green_s"]] = [7, 90]` sẽ được kéo dần 1 bước về đúng mặc định đó — không overshoot quá mặc định, an toàn tuyệt đối theo cấu trúc (luôn hợp lệ + luôn đi VỀ phía mặc định an toàn, không cần qua `validate()` nhưng vẫn cho đi qua để nhất quán/defense-in-depth).
+- `sim/runner.py`: `_decay_green_bounds_for_cycle()` — chạy **mỗi chu kỳ điều khiển** (không phụ thuộc agent có quyết định gì cycle đó hay không, không phụ thuộc `pending_task` còn chạy hay không), áp trực tiếp qua `apply_action()` và **ghi vào bảng `decisions`** y hệt 1 quyết định thật (`applied=True`, `final_action_type`/`final_action_params`/`applied_sim_time` đầy đủ) — **bắt buộc phải ghi**, không được áp thẳng vào TraCI rồi bỏ qua, vì Bước 17's `--replay` dựa hoàn toàn vào giả định "mọi hành động thay đổi TraCI đều nằm trong `decisions`"; bỏ qua sẽ làm replay tương lai của run này sai lệch. Đánh dấu rõ bằng `supervisor_verdict="approved"` + `supervisor_reason="Automatic passive decay... no LLM/coalition/supervisor call made this cycle."` để phân biệt với quyết định thật của agent trên dashboard, không lẫn lộn.
+- `agents/junction.py`: cập nhật system prompt (bump cache_key `v7`→`v8`) báo cho model biết cơ chế decay này tồn tại — để model không cần tự tay hạ bound thủ công (dù thực tế nó cũng chưa từng làm việc đó), tránh prompt nói sai về môi trường thật.
+
+**Test**: 7 test mới trong `tests/test_validator.py` (thuần, không I/O) — no-op khi đã ở mặc định, kéo `min_green_s` xuống đúng 1 bước, kéo `max_green_s` lên đúng 1 bước, không overshoot qua mặc định, step tuỳ chỉnh đủ lớn về thẳng mặc định trong 1 lần gọi, bỏ qua phase yellow/all-red, và kết quả decay luôn qua được `validate()` không bị clamp/reject thêm lần nữa. Cập nhật 2 test cache_key cũ (`test_junction.py`) sang `v8`. Toàn suite: **145/145 pass**.
+
+**Kiểm chứng thật (TraCI thật, không cần OpenAI — giống tinh thần Bước 17)**: chạy `grid_4x4` thật, đẩy `min_green_s` một phase lên 75 giả lập ratchet, gọi `decay_green_bounds` + `apply_action` qua TraCI thật → xác nhận bound thực sự giảm về 70 (đúng 1 bước) trong SUMO. Lặp lại có kèm `Store`/Postgres thật → xác nhận đúng 1 row `decisions` được ghi với đầy đủ `final_action_type`/`applied_sim_time`, dọn sạch sau đó.
+
+**Giới hạn minh bạch còn lại**: đây là fix dựa trên bằng chứng thật (dữ liệu quyết định của chính 2 run bạn đã chạy) và verify được cơ chế đúng bằng TraCI thật + unit test — nhưng **chưa thể verify fix này thực sự giải quyết được vấn đề `llm` thua `fixed`** vì việc đó cần 1 run `--mode llm` thật mới (tốn tiền OpenAI, luôn là việc của bạn). Đề nghị bạn chạy lại đúng seed=42 trên cả 2 mạng để so sánh trực tiếp với 2 run cũ:
+```bash
+python -m sumo_agents.sim.runner --scenario mixed_district --mode llm --seed 42
+python -m sumo_agents.sim.runner --scenario osm_real --mode llm --seed 42
+# kỳ vọng: mean_travel_time_s cải thiện rõ so với 139.37 / 106.04, tốt nhất là vượt qua fixed (130.86 / 97.92)
+```
+Cũng nên chạy lại 1 seed trên `grid_4x4` để xác nhận decay không làm giảm chất lượng ở nơi vốn đã ổn (kỳ vọng: gần 111.85, không tệ hơn đáng kể).
+
+### Follow-up #2 · Kết quả seed=42 sau fix (3 mạng) + rút lại giả thuyết sai về `osm_real`
+
+Bạn tự chạy lại `--mode llm` seed=42 trên cả 3 mạng sau khi decay fix vào. Bảng đầy đủ (`data/compare/<scenario>.md`, không chỉ `mean_travel_time_s`):
+
+| scenario | mode | wait (s) | travel (s) | queue p95 | CO2 (mg/s) |
+|---|---|---|---|---|---|
+| grid_4x4 | fixed/actuated/maxpressure/**llm** | 6.5/2.8/6.2/**2.9** | 134.3/107.4/139.5/**108.2** | 13/5/13/**6** | 23580/19529/24404/**19735** |
+| mixed_district | fixed/actuated/maxpressure/**llm** | 10.7/5.2/10.5/**4.9** | 130.9/104.3/137.2/**109.3** | 12/7/12/**8** | 12199/9786/12559/**10227** |
+| osm_real | fixed/actuated/maxpressure/**llm** | 3.5/2.1/3.5/**2.1** | 97.9/101.6/97.9/**105.5** | 4/3/4/**3** | 3102/3219/3102/**3296** |
+
+Fix đạt hiệu quả rõ trên `mixed_district` (139.37→109.3, tốt hơn cả `fixed` lẫn `maxpressure`) và `grid_4x4` vẫn ổn định gần `actuated`. Trên `osm_real`, cải thiện rất ít (106.04→105.5) — ban đầu tôi kết luận nguyên nhân là 3/6 `agent_junctions.yaml` có cấu trúc 1-pha (không có hướng cạnh tranh) khiến `set_green_bounds` vô nghĩa ở đó.
+
+**Kết luận đó sai — bạn chỉ ra đúng** khi so lại toàn bộ bảng (không chỉ `mean_travel_time_s`): `llm`'s `mean_waiting_s` (2.1) và `queue_p95` (3) **khớp chính xác** với `actuated` (2.1 / 3) — nếu giả thuyết "junction 1-pha làm hại riêng llm" đúng thì các chỉ số cục bộ của `llm` phải TỆ HƠN `actuated`, không phải bằng nhau. Đã rút lại giả thuyết.
+
+**Điều tra lại đúng hướng — kiểm chứng bằng teleport thật** (script độc lập, không Postgres, không LLM, có bật `incidents.yaml` đúng như run thật — lần đầu tôi quên bật nên số không khớp, phát hiện và sửa lại): chạy `fixed`/`actuated` trên `osm_real`, đếm mọi lần teleport thật qua `simulation.getStartingTeleportIDList()`:
+
+| | fixed | actuated |
+|---|---|---|
+| Tổng vehicle | 2400 | 2400 |
+| Số lần teleport | 3 | 2 |
+| Mean travel time (tất cả) | 97.92s | 101.65s |
+| Mean travel time (loại xe từng bị teleport) | 97.34s | 101.28s |
+
+Chỉ 2-3/2400 xe bị teleport (đúng khung sự cố 1200-1800s), và loại hẳn chúng khỏi mean chỉ đổi <1s — khoảng cách `actuated` vs `fixed` (~4%) **vẫn còn nguyên** dù có/không outlier. Giả thuyết "outlier/teleport làm méo mean" cũng bị loại.
+
+**Kết luận cuối cùng** (dựa trên bằng chứng, không suy đoán thêm): khoảng cách còn lại trên `osm_real` là đặc tính CỐ HỮU của baseline `actuated` (gap-based, chờ "gap" xe) trên topology phố thật (block ngắn, hình học bất thường) so với chu kỳ cố định của `fixed` — không liên quan gì đến chất lượng quyết định của agent/LLM (`llm` đang bám sát `actuated` gần như tuyệt đối). Đây là giới hạn đã biết của baseline, không phải bug cần sửa ở Bước 18/19. Không cần chỉnh `--time-to-teleport` (vẫn để mặc định 300s của SUMO) — teleport hoạt động đúng thiết kế (chống deadlock thật) và đã được chứng minh không phải nguyên nhân.
+
+Quyết định: dừng đào sâu thêm `osm_real`'s baseline gap (không phải việc của Bước 18/19), chuyển sang Bước 19 (VMS/rerouting).
 
 ---
 
 # PHASE 4 — Mở rộng
 
-## Bước 19 · VMS / rerouting + compliance rate
-`traci.vehicle.setAdaptedTraveltime()`, chỉ xe có `device.rerouting` phản ứng. Mô hình **compliance rate** (mặc định 0.4) — không phải ai cũng nghe theo biển.
-**DoD**: một `request_vms` làm thay đổi phân bố lưu lượng có đo được trên tuyến thay thế
+## Bước 19 · VMS / rerouting + compliance rate ✅
+
+**Mục tiêu**: `request_vms` (đã có sẵn ở `safety/validator.py`/`agents/protocol.py` từ trước, nhưng `sim/actuators.py.apply_action` chưa từng implement nó — luôn raise `NotImplementedError`, bị `_apply_llm_decisions` bắt và ghi `applied=False`) giờ thực sự tác động lên TraCI, có mô hình compliance rate.
+
+**Cơ chế** (`sim/actuators.py._apply_request_vms`, dùng đúng API plan section 5 nêu — `traci.vehicle.setAdaptedTraveltime` + `vehicle.rerouteTraveltime`):
+- Ứng viên = xe đang chạy (`vehicle.getIDList()`) mà `action.edge` còn ở PHÍA TRƯỚC trong route hiện tại (`getRoute()[getRouteIndex():]`) — xe đã đi qua rồi hoặc không bao giờ đi qua thì 1 biển báo VMS cũng vô nghĩa với nó.
+- Trong số ứng viên, chỉ xe có `has.rerouting.device == "true"` mới "phản ứng" được (param này do `device.rerouting.probability` trong mỗi `sim.sumocfg` gán ngẫu nhiên lúc xe được tạo) — đúng yêu cầu plan "chỉ xe có device.rerouting phản ứng".
+- **Compliance rate** (`DEFAULT_VMS_COMPLIANCE_RATE = 0.4`, đúng giá trị mặc định plan nêu): mỗi xe hợp lệ được rút thăm — nhưng là rút thăm **tất định**, seed từ `f"{junction_id}:{edge}:{duration_s}:{vehicle_id}"`, KHÔNG dùng 1 `random.Random` dùng chung xuyên suốt run. Lý do: yêu cầu tái lập của Bước 17 (`--replay`) — áp lại đúng 1 `RequestVms` đã ghi trong `decisions` phải rẽ đúng y hệt tập xe đó mỗi lần, không phụ thuộc thứ tự gọi hay trạng thái RNG toàn cục nào khác.
+- Xe tuân thủ: gọi `setAdaptedTraveltime(vid, edge, travel_time_hiện_tại×100, begin=sim_time, end=sim_time+duration_s)` rồi `rerouteTraveltime(vid, currentTravelTimes=False)` — xe tự tính lại đường đi NHANH NHẤT theo trọng số đã bị nó tự "nhìn thấy" là chậm hơn 100 lần, không nhất thiết đi đúng `alt_route` bên trong action (field đó chỉ dùng để `validator.py` kiểm tra không có vòng lặp — 1 biển VMS thật cũng chỉ nói "tránh chỗ này", không ép tài xế đi đúng từng khúc đường).
+- **Lỗi thật phát hiện khi verify bằng TraCI thật**: gọi `setAdaptedTraveltime(..., begTime=..., endTime=...)` theo đúng tên tham số trong docstring của `traci` — chạy trên backend mặc định (`libsumo`) báo `TypeError: unexpected keyword argument 'begTime'`. Bản build libsumo hiện tại chỉ nhận vị trí (positional), không nhận keyword ở đây dù `traci`'s Python wrapper có. Đã sửa gọi theo vị trí, verify lại chạy sạch trên cả `libsumo`.
+
+**Cho agent biết ID cạnh thật** (`agents/junction.py`, `sim/actuators.py.incoming_edges` mới): trước đây `JunctionAgent` không hề thấy edge ID nào trong prompt — đề xuất `request_vms(edge=...)` chỉ là đoán mò. Giờ mỗi chu kỳ, user prompt liệt kê `incoming_edges` thật của junction (suy ra từ `phase_lane_groups` có sẵn qua `lane.getEdgeID`, tính 1 lần/run, verify thật không lỗi trên cả 3 mạng kể cả topology bất thường của `mixed_district`/`osm_real`). System prompt cập nhật: `edge` phải là 1 trong các `incoming_edges`, nói rõ compliance chỉ ~40% (không phải giải pháp chắc chắn), và không dùng `request_vms` thay cho `set_green_bounds` khi vấn đề thực chất là timing đèn chứ không phải bản thân con đường. Bump cache_key `v8`→`v9`.
+
+**Test**: `sim/actuators.py` vốn không có unit test riêng (đúng quy ước từ Bước 3/5/8/14/18 — verify bằng chạy SUMO thật, không mock TraCI). 2 test mới trong `test_junction.py` (prompt có/không có `incoming_edges`), cập nhật 2 test cache_key sang `v9`. Toàn suite: **147/147 pass**.
+
+**Kiểm chứng thật bằng TraCI** (script tạm, không Postgres/LLM — cùng tinh thần Bước 14/17/18), trên `grid_4x4`, seed=42:
+1. *Chọn đúng ứng viên + rẽ đúng dự đoán*: chọn cạnh `B2C2` (11 xe có nó ở phía trước), rút thăm tất định dự đoán 5/11 tuân thủ; áp thật → đúng 3/5 xe đó đổi route thật sự. 2 xe còn lại không đổi — kiểm tra riêng: `getAdaptedTraveltime` xác nhận trọng số bị phạt ĐÃ được set đúng trên xe đó (1350s thay vì 13.5s), nhưng route vẫn giữ nguyên vì route còn lại của chính 2 xe đó (`B3B2→B2C2` và `C2B2→B2C2→C2D2→D2D1`) không có đường nào khác tới đích — đúng như docstring đã nêu trước: 1 cạnh không có đường vòng thật thì xe vẫn phải đi qua nó, không phải lỗi.
+2. *Tất định qua 2 lần chạy độc lập từ cùng trạng thái*: tập xe thực sự đổi route giống hệt nhau cả 2 lần (n=3, khớp 100%) — đúng yêu cầu tái lập cho `--replay`.
+3. *Hiệu ứng đo được lên phân bố lưu lượng (DoD)*: so tổng số xe hiện diện trên cạnh `B2C2` mỗi step trong 600 step tiếp theo, có/không áp `request_vms`, cùng seed/trạng thái xuất phát — **giảm 216/1971 (11.0%)**.
+
+**DoD đạt được**: `request_vms` giờ thực sự làm thay đổi phân bố lưu lượng đo được lên tuyến bị gắn biển (11% giảm lưu lượng qua cạnh đó trong ví dụ trên) — không còn là hành động luôn bị `apply_action` từ chối áp dụng. `agent_junctions.yaml`/quy ước không đổi, không cần chạy lại các mạng cũ.
+
+**Giới hạn minh bạch còn lại**: đây là verify MECHANISM bằng TraCI thật, không phải verify agent LLM có thực sự CHỌN gọi `request_vms` một cách hợp lý khi chạy thật hay không (đó luôn cần 1 run `--mode llm` thật, việc của bạn). Việc thêm `incoming_edges` vào prompt tăng khả năng model đề xuất `edge` hợp lệ, nhưng không đảm bảo `alt_route` nó tự nghĩ ra là tối ưu — hệ thống không dựa vào `alt_route` để rẽ hướng (chỉ dựa vào cạnh bị phạt trọng số), nên điều đó không quan trọng bằng việc `edge` có thật.
+
+### Follow-up · Bạn tự chạy `--mode llm` thật trên cả 3 mạng — `request_vms` chưa từng được gọi, tìm nguyên nhân + sửa
+
+Bạn chạy lại `scripts/compare.py` seed=42 trên cả 3 mạng sau Bước 19 (`80eefb9e`/`d52f36ab`/`cd9e809b`). Chỉ số tổng hợp cải thiện rõ trên cả 3 (so với follow-up #2 của Bước 18):
+
+| scenario | llm wait | llm travel | llm CO2 |
+|---|---|---|---|
+| grid_4x4 | 2.7 (< actuated 2.8) | 104.9 (< actuated 107.4) | 19255 (< actuated 19529) |
+| mixed_district | 4.6 (< actuated 5.2) | 100.7 (< actuated 104.3) | 9627 (< actuated 9786) |
+| osm_real | 1.7 (< actuated 2.1, tốt nhất 4 mode) | 100.1 (< actuated 101.6, vẫn kém `fixed` 97.9) | 3180 |
+
+`grid_4x4`/`mixed_district`: `llm` giờ thắng `actuated` ở MỌI chỉ số. `osm_real`: khoảng cách với `fixed` thu hẹp đáng kể nhưng vẫn còn (giới hạn baseline đã biết, không phải lỗi agent).
+
+**Nhưng**: query trực tiếp `decisions` cho cả 3 run — **`request_vms` được đề xuất 0/814 lần** (grid_4x4 0/262, mixed_district 0/284, osm_real 0/268 — toàn bộ chỉ `set_green_bounds`/`no_action`). Cơ chế đã verify chạy đúng (xem trên) nhưng chưa từng được kích hoạt thật.
+
+**Đào sâu bằng dữ liệu thật, không suy đoán**: đọc lại `messages.rationale` quanh đúng khung sự cố (1200-1800s, `incidents.yaml`), tại đúng junction sát cạnh bị sự cố ở cả 3 mạng (B1/grid_4x4, "2"/mixed_district, 98010042/osm_real — cả 3 đều có cạnh sự cố nằm trong `incoming_edges` của chính nó). Model có nhắc VMS nhiều lần ở các chu kỳ khác ("chưa có cơ sở điều chỉnh tín hiệu hoặc VMS") nhưng KHÔNG hề nhắc trong đúng khung sự cố — dù tại đó nó tự ghi nhận `mean_speed_mps=0.0` liên tục nhiều chu kỳ (dấu hiệu tắc thật kinh điển) ở `osm_real`. Nguyên nhân: `queue_len`/`mean_waiting_s`/`mean_speed_mps` model thấy đều ở MỨC PHA (per-phase, `sim/state.py`/`per_phase_traffic`) — không có tín hiệu nào cho biết "chính cạnh đường này bất thường", nên dù tốc độ về 0, model vẫn chỉ diễn giải được là vấn đề timing đèn.
+
+**Đã sửa**: thêm `sim/actuators.py.incoming_edge_conditions` (+ `edge_speed_limits`) — tốc độ hiện tại vs. giới hạn tốc độ CỦA CHÍNH cạnh đó, hiển thị trong prompt cạnh mỗi `incoming_edge`, kèm cờ `[near-stopped -- possible blockage on this road]` khi tỷ lệ < 15%. System prompt (`agents/junction.py`) hướng dẫn rõ: dùng `request_vms` CHỈ khi tốc độ cạnh tự nó gần 0 dù giới hạn bình thường (đường bị chặn thật), không dùng khi chỉ là `queue_len` cao (đó là vấn đề timing, dùng `set_green_bounds`). Cache_key `v9`→`v10`.
+
+**Lỗi thật phát hiện khi tự verify bằng TraCI thật** (không tin ngay, kiểm tra lại): lần đầu implement, đọc `speed_limit_mps` TRỰC TIẾP (`lane.getMaxSpeed()`) mỗi chu kỳ — verify trên cả 3 mạng phát hiện đúng cạnh bị sự cố lại KHÔNG được gắn cờ, vì `sim/incidents.py`'s `IncidentInjector` cũng hạ luôn `lane.setMaxSpeed()` của chính cạnh đó khi mô phỏng sự cố, nên "giới hạn" đọc live trong lúc sự cố đã bị hạ theo — cạnh sự cố trông như "đang chạy đúng giới hạn của nó" (tỷ lệ ~0.65-1.0), trong khi các cạnh KẾ BÊN (ùn ứ do sự cố nhưng giới hạn không đổi) mới bị gắn cờ đúng. Đã sửa: tách `edge_speed_limits()` đọc CHỈ 1 LẦN ngay sau `conn.start()` (sim_time=0, chắc chắn chưa sự cố nào bắt đầu) — cùng quy ước "tính 1 lần, dùng lại mỗi chu kỳ" như `incoming_edges`/`phase_lane_groups`. Verify lại: cả 3 mạng đều gắn cờ đúng cạnh sự cố thật (`B2B1`/`"3"`/`-1223385256#0`) trong khung 1200-1800s.
+
+**Test**: 1 test mới (`test_observe_flags_a_near_stopped_edge_in_the_user_prompt`) kiểm tra cờ hiển thị đúng cạnh, không hiển thị nhầm cạnh khác. Toàn suite: **148/148 pass**.
+
+**Giới hạn minh bạch còn lại**: đây vẫn chỉ verify được MECHANISM (tín hiệu tốc độ hiển thị đúng, gắn cờ đúng cạnh sự cố thật) bằng TraCI thật — chưa verify được liệu bổ sung này có thực sự khiến agent CHỌN gọi `request_vms` khi chạy `--mode llm` thật hay không. Đề nghị bạn chạy lại 1 mạng (gợi ý `osm_real` — có tín hiệu tắc rõ nhất, `mean_speed_mps=0.0` nhiều chu kỳ) để xem lần này `request_vms` có xuất hiện trong `decisions` không:
+```bash
+python scripts/compare.py --scenario osm_real --modes fixed,actuated,maxpressure,llm --seeds 42
+```
+
+### Follow-up #2 · Bạn chạy lại osm_real — `request_vms` kích hoạt, nhưng phần lớn là báo động giả
+
+Bạn chạy lại `osm_real` (run `b234b2d5`). Chỉ số tổng hợp nhích nhẹ (`llm`: wait 1.7, travel 100.6, CO2 3134 — so 105.5/1.7/3296 trước Bước 19, 100.1/1.7/3180 sau v10). Query `decisions`: **`request_vms` giờ xuất hiện 37/128 lần (29%)**, tất cả `validator_status='ok'`, `applied=True` — cơ chế đã kích hoạt lần đầu tiên.
+
+**Nhưng đào sâu**: chỉ **8/37 (22%)** rơi đúng khung sự cố thật (1200-1800s, `incidents.yaml`). Tally theo cạnh: 2 cạnh (`-399561785#0`: 8 lần, `1223385256#3`: 6 lần — 14/37, gần 40%) chiếm áp đảo. Tra `sumolib`: cả 2 chỉ dài **5.44m và 6.29m** — thực chất chỉ là đoạn ngay trước vạch dừng đèn. 1 xe đứng chờ đèn đỏ bình thường trên đoạn ngắn này đã đủ đọc tốc độ ≈0, hoàn toàn không phải sự cố.
+
+**Nguyên nhân gốc**: `incoming_edge_conditions` (v10) chỉ đọc **1 lần duy nhất mỗi chu kỳ** (last-step speed) — không có lịch sử nhiều chu kỳ để lọc nhiễu, khác với `queue_len`/`mean_waiting_s` vốn đã được bảo vệ bằng `_build_trend_text` (3 chu kỳ) + chính prompt cũng dặn "một lần đọc nhiễu không đủ căn cứ". Tín hiệu tốc độ per-edge mới thêm không có sự bảo vệ đó.
+
+**Đã sửa** (`agents/junction.py`, `sim/runner.py`): cờ `[near-stopped]` giờ yêu cầu tỷ lệ tốc độ thấp **LIÊN TỤC qua 3 chu kỳ quyết định gần nhất** (`_EDGE_NEAR_STOPPED_MIN_CONSECUTIVE_CYCLES=3`, ~270s liên tục — trong khi 1 lần chờ đèn đỏ chỉ thoáng qua, còn sự cố thật kéo dài 600s) mới xuất hiện, không phải 1 lần đọc. `sim/runner.py` duy trì `edge_ratio_history` mỗi (junction, edge) — đúng quy ước "snapshot TRƯỚC khi ghi thêm giá trị chu kỳ này" như `snapshot_history` đã có. System prompt cập nhật: dặn model dựa vào CHÍNH cờ hiển thị, không tự suy diễn từ số thô. Cache_key `v10`→`v11`.
+
+**Test**: 2 test mới thay cho 1 test cũ (`test_observe_flags_an_edge_near_stopped_for_several_cycles_running` — chỉ gắn cờ khi liên tục thấp qua lịch sử; `test_observe_does_not_flag_a_single_low_reading_with_no_history` — 1 lần đọc thấp, không lịch sử, không gắn cờ — đúng y hệt pattern báo động giả tìm thấy). Toàn suite: **149/149 pass**.
+
+**Kiểm chứng thật bằng TraCI** (replay lại toàn bộ `osm_real`, seed=42, đúng cách `sim/runner.py` duy trì lịch sử): tổng 25 lần gắn cờ toàn run — chỉ **1/25** rơi vào 2 cạnh từng gây báo động giả (giảm từ 14/37 ≈ chiếm đa số xuống gần như 0), **24/25** đều là cạnh sự cố thật hoặc cạnh liền kề bị ùn do chính sự cố đó, tập trung sát khung 1200-1800s.
+
+**Giới hạn minh bạch còn lại**: vẫn chỉ verify được cơ chế (lịch sử đúng, gắn cờ đúng cạnh, đúng thời điểm) bằng TraCI thật, chưa verify được agent thật sẽ dùng `request_vms` thế nào với tín hiệu đã lọc sạch nhiễu này. Đề nghị chạy lại đúng lệnh trên (`osm_real`, seed=42) để so trực tiếp với run `b234b2d5`:
+```bash
+python scripts/compare.py --scenario osm_real --modes fixed,actuated,maxpressure,llm --seeds 42
+```
 
 ## Bước 20 · Sinh scenario bằng AI
 Prompt tiếng Việt → `gpt-5.6-sol` sinh `ScenarioSpec` (structured output) → Pydantic validate → `build.py` dịch thành lệnh `netgenerate`/`randomTrips`. **AI không bao giờ sinh trực tiếp `.net.xml`.**
