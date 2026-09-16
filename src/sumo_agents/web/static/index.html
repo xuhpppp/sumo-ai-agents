@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>sumo-agents dashboard</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>sumo-agents dashboard</h1>
+    <select id="run-select"><option>Đang tải danh sách run...</option></select>
+    <span id="run-status" class="run-status">—</span>
+  </header>
+
+  <main>
+    <section class="panel" id="panel-map">
+      <h2>Network snapshot</h2>
+      <p class="hint">
+        Ảnh chụp tải theo nút (queue_len mới nhất, mẫu mỗi 10s mô phỏng) — thay cho bản đồ hình học thật.
+        Muốn xem đúng vị trí xe trực quan, chạy <code>--gui</code> để mở SUMO GUI riêng.
+      </p>
+      <div id="junction-grid" class="junction-grid"></div>
+    </section>
+
+    <section class="panel" id="panel-chat">
+      <h2>Agent chat</h2>
+      <p class="hint">Tin nhắn coalition giữa các agent, theo cycle_id — hiện rationale tiếng Việt của model.</p>
+      <div id="chat-log" class="scroll"></div>
+    </section>
+
+    <section class="panel" id="panel-decisions">
+      <h2>Decision log</h2>
+      <p class="hint">Mới nhất ở trên. Màu theo validator_status/supervisor_verdict.</p>
+      <div class="scroll">
+        <table class="decisions">
+          <thead>
+            <tr>
+              <th>cycle</th><th>t (s)</th><th>junction</th><th>action</th>
+              <th>validator</th><th>supervisor</th><th>applied</th><th>effect</th>
+            </tr>
+          </thead>
+          <tbody id="decisions-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-monitoring">
+      <h2>Monitoring</h2>
+      <div id="kpi-row" class="kpi-row"></div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

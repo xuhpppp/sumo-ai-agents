@@ -1,0 +1,290 @@
+/* STEPS.md Step 16 -- 4-panel dashboard styling.
+   Palette: the dataviz skill's validated reference instance (categorical
+   slot 1 = blue for the sequential load grid, fixed status palette for
+   validator/supervisor verdicts). Values copied verbatim -- swap them only
+   if this project ever adopts a different brand palette, and re-validate. */
+
+:root {
+  color-scheme: light;
+  --surface-1: #fcfcfb;
+  --page-plane: #f9f9f7;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --gridline: #e1e0d9;
+  --border: rgba(11, 11, 11, 0.10);
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-critical: #d03b3b;
+  --seq-100: #cde2fb;
+  --seq-250: #86b6ef;
+  --seq-400: #3987e5;
+  --seq-550: #1c5cab;
+  --seq-700: #0d366b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --page-plane: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --gridline: #2c2c2a;
+    --border: rgba(255, 255, 255, 0.10);
+    --status-good: #0ca30c;
+    --status-warning: #fab219;
+    --status-critical: #e66767;
+    --seq-100: #b7d3f6;
+    --seq-250: #6da7ec;
+    --seq-400: #3987e5;
+    --seq-550: #184f95;
+    --seq-700: #0d366b;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1: #1a1a19;
+  --page-plane: #0d0d0d;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --gridline: #2c2c2a;
+  --border: rgba(255, 255, 255, 0.10);
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-critical: #e66767;
+  --seq-100: #b7d3f6;
+  --seq-250: #6da7ec;
+  --seq-400: #3987e5;
+  --seq-550: #184f95;
+  --seq-700: #0d366b;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--page-plane);
+  color: var(--text-primary);
+  /* "Segoe UI" listed explicitly before the generic `system-ui` keyword --
+     on a Windows machine set to a non-Latin UI language (e.g. ja-JP),
+     Chromium's `system-ui` can resolve to that locale's CJK UI font
+     instead of Segoe UI, which renders Vietnamese's double-diacritic
+     precomposed letters (ắ, ế, ẫ, ỗ, ...) with the marks mis-positioned as
+     a visible gap -- single-diacritic letters (á, ữ, ủ, ...) are
+     unaffected, which is what gave this away. Naming the family directly
+     skips that locale-dependent resolution. */
+  font: 14px/1.5 "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+header h1 {
+  font-size: 16px;
+  margin: 0;
+  white-space: nowrap;
+}
+
+header select {
+  font: inherit;
+  padding: 4px 8px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.run-status {
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.run-status.running { color: var(--status-good); border-color: var(--status-good); }
+.run-status.finished { color: var(--text-muted); }
+
+main {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 16px;
+  padding: 16px 20px;
+}
+
+.panel {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  min-width: 0;
+}
+
+.panel h2 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  margin: 0 0 10px;
+}
+
+.panel .scroll {
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.panel .hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 0 0 10px;
+}
+
+.empty-state {
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 12px 0;
+}
+
+/* ---- Network snapshot: sequential-hue load grid ---- */
+
+.junction-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 6px;
+}
+
+.junction-tile {
+  border-radius: 6px;
+  padding: 8px 6px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.junction-tile .jid {
+  display: block;
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+.junction-tile .qlen {
+  display: block;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+/* ---- Agent chat ---- */
+
+.chat-cycle-divider {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin: 12px 0 4px;
+  border-top: 1px dashed var(--gridline);
+  padding-top: 6px;
+}
+.chat-cycle-divider:first-child { margin-top: 0; border-top: none; padding-top: 0; }
+
+.chat-message {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--gridline);
+}
+.chat-message:last-child { border-bottom: none; }
+
+.chat-message .meta {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.chat-message .intent {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-right: 4px;
+}
+.intent-report, .intent-ack { background: var(--gridline); color: var(--text-secondary); }
+.intent-request_help, .intent-propose { color: var(--status-warning); border: 1px solid var(--status-warning); }
+.intent-object { color: var(--status-critical); border: 1px solid var(--status-critical); }
+
+.chat-message .rationale {
+  margin-top: 2px;
+}
+
+/* ---- Decision log ---- */
+
+table.decisions {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+table.decisions th {
+  text-align: left;
+  color: var(--text-muted);
+  font-weight: 500;
+  border-bottom: 1px solid var(--gridline);
+  padding: 4px 6px;
+  position: sticky;
+  top: 0;
+  background: var(--surface-1);
+}
+table.decisions td {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--gridline);
+  vertical-align: top;
+}
+table.decisions td.num { font-variant-numeric: tabular-nums; }
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.badge-good { color: var(--status-good); border: 1px solid var(--status-good); }
+.badge-warning { color: var(--status-warning); border: 1px solid var(--status-warning); }
+.badge-critical { color: var(--status-critical); border: 1px solid var(--status-critical); }
+.badge-neutral { color: var(--text-muted); border: 1px solid var(--gridline); }
+
+/* ---- Monitoring: KPI stat tiles ---- */
+
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px;
+}
+
+.stat-tile {
+  border: 1px solid var(--gridline);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.stat-tile .label {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.stat-tile .value {
+  font-size: 22px;
+  font-weight: 600;
+  margin-top: 2px;
+}
+
+.stat-tile .sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
