@@ -170,6 +170,32 @@ class Decision(Base):
     supervisor_reason: Mapped[str | None] = mapped_column(Text)
     applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     effect: Mapped[dict | None] = mapped_column(JSONType)
+    # What was ACTUALLY pushed to TraCI once `applied` is True -- may differ
+    # from `action_type`/`params` above (the original proposal) when the
+    # validator clamped it (validator_status="clamped") or the supervisor
+    # substituted a different action (supervisor_verdict="modified").
+    # `None` for a decision that was never applied (rejected/denied), and for
+    # baseline-mode (fixed/actuated/maxpressure) decisions, which apply
+    # synchronously at decide()-time and have no separate "proposed vs.
+    # applied" distinction to record. STEPS.md Step 17 (`--replay`) is the
+    # reader that actually needs this -- it must re-apply the exact action
+    # that changed the simulation the first time, not just the proposal.
+    final_action_type: Mapped[str | None] = mapped_column(String)
+    final_action_params: Mapped[dict | None] = mapped_column(JSONType)
+    # The sim_time at which `final_action` was ACTUALLY pushed to TraCI --
+    # NOT the same instant as `sim_time` above for mode="llm" decisions,
+    # because the decision cycle runs as a background asyncio task
+    # (sim/runner.py's Step 14 docstring): `sim_time` is when the cycle
+    # started (observe/propose), `applied_sim_time` is whenever the main
+    # loop later notices the task finished, which the LLM_REALTIME_SPEEDUP
+    # pacing puts anywhere from a few to ~90+ simulated seconds afterward.
+    # STEPS.md Step 17 (`--replay`) needs this to re-apply an action at the
+    # same simulated moment it truly took effect the first time, not at the
+    # (earlier) moment it was decided -- applying it too early measurably
+    # changes the replayed trajectory (~1% off on mean_travel_time_s in
+    # practice). `None` for anything that isn't a mode="llm" decision, and
+    # for `llm` runs recorded before this column existed.
+    applied_sim_time: Mapped[float | None] = mapped_column(Float)
 
 
 class LlmCall(Base):

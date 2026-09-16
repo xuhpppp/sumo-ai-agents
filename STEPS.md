@@ -30,7 +30,7 @@
 | 14 | Nối vào SimRunner, chạy full 1h | 2 | 3h | ✅ |
 | 15 | Backend dashboard + WebSocket | 3 | 3h | ✅ |
 | 16 | 4 panel frontend | 3 | 5h | ✅ |
-| 17 | Chế độ `--replay` | 3 | 2h | ⬜ |
+| 17 | Chế độ `--replay` | 3 | 2h | ✅ |
 | 18 | Mạng lưới đa dạng (mixed + OSM) | 3 | 3h | ⬜ |
 | 19 | VMS / rerouting + compliance rate | 4 | 3h | ⬜ |
 | 20 | Sinh scenario bằng AI | 4 | 3h | ⬜ |
@@ -582,9 +582,39 @@ asyncio.run(main())
 
 **DoD**: đạt được ở mức cơ chế/dữ liệu (4 panel dựng đúng, cập nhật live đúng, màu theo status/nghĩa dữ liệu, không cần đọc code để hiểu — text tiếng Việt giải thích rõ mỗi panel) — xác nhận trực quan cuối cùng để trong tay người dùng.
 
-## Bước 17 · Chế độ `--replay`
-Cache toàn bộ I/O LLM theo `run_id`; `--replay` chạy lại không gọi API.
-**DoD**: replay một run cũ, chi phí **$0**, dashboard hiển thị y hệt lần chạy gốc
+## Bước 17 · Chế độ `--replay` ✅
+
+**Mục tiêu**: replay một run `mode="llm"` cũ mà không gọi OpenAI — demo/debug UI tốn $0.
+
+**Quyết định thiết kế**: plan §6.3 nói "ghi toàn bộ I/O của LLM... `--replay` chạy lại từ cache". Thay vì thêm một bảng cache raw request/response riêng, dùng thẳng `messages`/`decisions`/`llm_calls` **đã có sẵn** của run gốc làm "cache" — chúng đã chứa mọi thứ dashboard cần hiển thị (rationale, action đã áp dụng, verdict, token/cost/latency), khoá theo `sim_time` (duy nhất trong 1 run vì `CONTROL_INTERVAL_S` cố định). Vì SUMO tất định theo (scenario, seed) — đã verify từ Bước 5 — chạy lại đúng scenario/seed và tại mỗi chu kỳ áp lại **đúng action đã thực sự thay đổi mô phỏng lần trước** (không phải action được đề xuất — có thể đã bị validator clamp hoặc supervisor `modified`) sẽ tái tạo lại quỹ đạo mô phỏng giống hệt, không cần gọi `ask()` lần nào. Một chu kỳ không có dòng nào ở `sim_time` đó trong nguồn = chu kỳ đã bị skip ở run gốc (Bước 14) — tự động đúng, không cần đếm riêng.
+
+**Đã làm**:
+- `obs/models.py`: thêm 3 cột vào `decisions` (migration `76cd7af73eea` + `32116025d2fc`): `final_action_type`/`final_action_params` (action **thực sự** được áp dụng — có thể khác `action_type`/`params`, vốn luôn là action được **đề xuất**, nếu validator clamp hoặc supervisor `modified`) và `applied_sim_time`.
+- `obs/replay.py` (mới): `load_replay_source(session_factory, run_id)` — nạp toàn bộ `messages`/`decisions`/`llm_calls` của run nguồn (lỗi rõ ràng nếu không tồn tại hoặc không phải `mode="llm"`), `ReplaySource.at(sim_time)` tra theo mốc thời gian.
+- `sim/runner.py`:
+  - `run(replay_of=<run_id>)` + CLI `--replay RUN_ID` (không được kèm `--scenario/--mode/--seed` — đọc thẳng từ run nguồn). Không dựng `JunctionAgent`/`SupervisorAgent`/OpenAI client nào cả trong chế độ này.
+  - `_replay_decision_cycle()`: tại mỗi mốc điều khiển, copy `messages`/`llm_calls` sang `run_id` mới (giữ nguyên `sim_time`), ghi `decisions` mới nhưng **chưa** áp dụng ngay.
+  - **Phát hiện quan trọng lúc verify** (xem bên dưới): action của `mode="llm"` được quyết định tại `sim_time=T` (chạy nền bằng `asyncio.Task`) nhưng chỉ thực sự được đẩy vào TraCI **muộn hơn**, một khi vòng lặp chính phát hiện task xong — với `LLM_REALTIME_SPEEDUP=5.0` và latency thật ~10-20s/chu kỳ, độ trễ này tương đương hàng chục đến ~90+ giây mô phỏng. Áp action ngay tại `T` (thay vì tại đúng thời điểm nó thực sự xảy ra) đo được làm lệch quỹ đạo replay (~1% `mean_travel_time_s`). Sửa bằng cột `applied_sim_time` mới: `_apply_llm_decisions` giờ ghi lại đúng `sim_time` hiện tại (không phải `sim_time` lúc quyết định) khi action thực sự được áp; `_apply_due_replay_actions()` giữ action ở hàng đợi (`pending_replay_applies`, kiểm tra **mỗi bước mô phỏng**, không chỉ mỗi mốc điều khiển) tới khi đồng hồ mô phỏng của lần replay chạm đúng `applied_sim_time` đó rồi mới thực sự gọi `apply_action`.
+  - Run cũ hơn Bước 17 (toàn bộ run `llm` thật đã chạy tới nay) không có `final_action_type`/`applied_sim_time` → fallback về `action_type`/`params` (action đề xuất) áp ngay tại thời điểm quyết định — đúng 100% khi không bị clamp/modified (đã kiểm tra: run tốt nhất hiện có, `51a9788c`, có 232/232 decision đã áp là `validator_status=ok`+`supervisor_verdict=approved`, tức không clamp/modify — fallback ở đây chính xác tuyệt đối), nhưng **không thể** biết chính xác độ trễ áp dụng thật của run cũ đó → sai số quỹ đạo mô phỏng như mô tả trên, đã ghi nhận trung thực, không che giấu.
+  - Không throttle theo `LLM_REALTIME_SPEEDUP` khi replay (không có việc async thật nào phải chờ) — chạy tốc độ đầy đủ như baseline.
+  - `config.replay_of` = run_id nguồn, để phân biệt với run thật (dashboard: `app.js`'s `runOptionLabel` thêm hậu tố "· replay").
+
+**Test**: `tests/test_replay.py` (8 test mới, thuần DB/logic qua SQLite in-memory, không cần SUMO — `sim/runner.py` không có test module riêng từ trước, đúng lý do như Bước 5/8/14) — `load_replay_source` lỗi rõ ràng cho run không tồn tại/không phải `llm`; `ReplaySource.at()` gom đúng theo `sim_time`, trả rỗng cho chu kỳ bị skip; `_action_from_row` dựng lại đúng `SetGreenBounds`/`NoAction`; `_replay_decision_cycle` trả về đúng `pending_applies` với `target_sim_time` lấy từ `applied_sim_time` (hoặc fallback `sim_time` cho run cũ); `_apply_due_replay_actions` (mock `apply_action`) xác nhận **không** áp sớm khi chưa tới `applied_sim_time`, áp đúng lúc tới, và ghi đúng `applied_sim_time` vào DB — **test này bắt được 1 lỗi thật** trước khi verify bằng SUMO thật: lần viết đầu quên truyền `applied_sim_time` vào `update_decision()`, cột luôn `NULL`. Toàn bộ suite: **138/138 pass**.
+
+**Kiểm chứng thật** (khác mọi bước LLM trước đó: `--replay` **không gọi OpenAI** nên tự chạy được, không cần đợi bạn — đây là bước duy nhất trong Phase 2-3 tôi tự chạy `sim.runner` thật): `python -m sumo_agents.sim.runner --replay 51a9788c-...` (run coordination-context tốt nhất, đã có trong Postgres từ Bước 14) — 5-7s thực, **$0**, không lỗi:
+- `n_llm_calls`, `n_skipped_cycles`, số dòng `decisions`/`messages`/`llm_calls` — **giống hệt** run gốc (334/3/234/85/334), lặp lại 2 lần cho cùng kết quả (tất định).
+- `mean_travel_time_s`: 112.65s (replay) so với 111.85s (gốc) — lệch ~0.7%, đúng như dự đoán ở trên vì `51a9788c` là run **trước** Bước 17 (không có `applied_sim_time`, dùng fallback áp-ngay-lúc-quyết-định).
+- Dọn sạch cả 2 lần chạy thử khỏi Postgres, xác nhận lại — 0 row `replay_of='51a9788c-...'` còn sót.
+- CLI: `--replay` kèm `--scenario` → lỗi rõ ràng ("cannot be combined"); `--replay` với run_id không tồn tại → `ValueError` rõ ràng; thiếu cả 3 `--scenario/--mode/--seed` mà không có `--replay` → lỗi rõ ràng.
+
+**Giới hạn minh bạch còn lại**: chưa xác nhận được replay **bit-for-bit** cho một run `llm` ghi **sau** Bước 17 (mọi run `llm` thật hiện có trong Postgres đều từ trước bản sửa `applied_sim_time`) — vì tạo run đó cần chạy `--mode llm` thật (tốn tiền OpenAI), việc luôn dành cho bạn tự chạy. Cơ chế mới đã được test đơn vị đầy đủ (kể cả bắt được 1 lỗi thật, xem trên) nên tôi tin tưởng nó đúng, nhưng xác nhận cuối cùng bằng dữ liệu thật xin để bạn làm ở lần chạy `--mode llm` tiếp theo:
+```bash
+python -m sumo_agents.sim.runner --scenario grid_4x4 --mode llm --seed 42   # ghi lại run_id in ra
+python -m sumo_agents.sim.runner --replay <run_id_vừa_chạy>                 # $0, vài giây
+# rồi so sánh runs.summary.mean_travel_time_s / metrics giữa 2 run_id -- kỳ vọng: giống hệt (0 khác biệt)
+```
+
+**DoD đạt được**: replay chạy được, **$0** (không gọi OpenAI — xác nhận qua code path, không có import/gọi `agents/llm.py` nào trong nhánh replay), messages/decisions/llm_calls hiển thị **y hệt** run gốc trên dashboard (verify thật, xem trên); quỹ đạo mô phỏng (`metrics`/`mean_travel_time_s`) y hệt **cho run ghi từ nay trở đi** (cơ chế `applied_sim_time`, verify bằng unit test) — với run cũ hơn Bước 17 thì có sai số nhỏ đã đo và giải thích rõ nguyên nhân ở trên, không che giấu.
 
 ## Bước 18 · Mạng lưới đa dạng
 `mixed_district` (netgenerate --rand + chỉnh tay: ngã ba T, vòng xuyến, nút lệch) và `osm_real` (osmWebWizard, 1 quận thật).

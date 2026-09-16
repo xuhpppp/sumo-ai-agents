@@ -365,7 +365,10 @@ async function selectRun(runId) {
 
 function runOptionLabel(r) {
   const started = new Date(r.started_at).toLocaleString();
-  return `${r.mode} · seed=${r.seed} · ${started}${r.finished_at ? "" : " (đang chạy)"}`;
+  // STEPS.md Step 17: a run replayed via `--replay` carries config.replay_of
+  // -- flagged here so it's never mistaken for a real (paid) llm run.
+  const replayTag = r.config?.replay_of ? " · replay" : "";
+  return `${r.mode}${replayTag} · seed=${r.seed} · ${started}${r.finished_at ? "" : " (đang chạy)"}`;
 }
 
 async function loadRuns(preserveSelection) {

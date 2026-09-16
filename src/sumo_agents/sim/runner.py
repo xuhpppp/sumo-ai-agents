@@ -21,6 +21,7 @@ Usage:
     python -m sumo_agents.sim.runner --scenario grid_4x4 --mode actuated --seed 42
     python -m sumo_agents.sim.runner --scenario grid_4x4 --mode maxpressure --seed 42
     python -m sumo_agents.sim.runner --scenario grid_4x4 --mode llm --seed 42
+    python -m sumo_agents.sim.runner --replay <run_id>   # STEPS.md Step 17, $0, no OpenAI calls
 """
 
 from __future__ import annotations
@@ -45,8 +46,19 @@ from sumo_agents.baselines.fixed import FixedController
 from sumo_agents.baselines.maxpressure import MaxPressureController
 from sumo_agents.obs.db import make_async_engine, make_session_factory
 from sumo_agents.obs.models import LlmCall
+from sumo_agents.obs.replay import ReplaySource, load_replay_source
 from sumo_agents.obs.store import Store
-from sumo_agents.safety.validator import TlsState, validate
+from sumo_agents.safety.validator import (
+    Action,
+    AdjustPhaseSplit,
+    NoAction,
+    RequestVms,
+    SetCycleLength,
+    SetGreenBounds,
+    SetOffset,
+    TlsState,
+    validate,
+)
 from sumo_agents.sim.actuators import apply_action, per_phase_traffic, phase_lane_groups, read_tls_state
 from sumo_agents.sim.conn import Backend, SumoConnection
 from sumo_agents.sim.incidents import IncidentInjector, load_incident_schedule
@@ -112,6 +124,143 @@ def _metric_dict(snapshot: JunctionSnapshot) -> dict[str, float | int]:
         "mean_speed": snapshot.mean_speed,
         "throughput": snapshot.throughput,
     }
+
+
+# STEPS.md Step 17 (--replay): maps a `decisions.action_type`/
+# `final_action_type` string back to the Pydantic model that constructed it,
+# so a recorded (type, junction_id, params) row can be turned back into a
+# real `Action` and re-applied via `sim/actuators.py`'s `apply_action`.
+_ACTION_TYPES: dict[str, type[Action]] = {
+    cls.model_fields["type"].default: cls
+    for cls in (AdjustPhaseSplit, SetCycleLength, SetOffset, SetGreenBounds, RequestVms, NoAction)
+}
+
+
+def _action_from_row(action_type: str, junction_id: str, params: dict) -> Action:
+    return _ACTION_TYPES[action_type](junction_id=junction_id, **params)
+
+
+# One deferred replay apply: (target_sim_time, decision_id, action, effect
+# to write once applied). See `_replay_decision_cycle`/`_apply_due_replay_actions`.
+_PendingReplayApply = tuple[float, int, Action, dict | None]
+
+
+async def _replay_decision_cycle(
+    conn: SumoConnection,
+    store: Store,
+    run_id: uuid.UUID,
+    cycle_id: int,
+    sim_time: float,
+    replay_source: ReplaySource,
+) -> tuple[bool, list[_PendingReplayApply]]:
+    """Reproduce ONE decision cycle from `replay_source` at $0 API cost --
+    copies its `messages`/`llm_calls` verbatim (new run_id, same sim_time)
+    and writes a `decisions` row per source decision immediately, but does
+    NOT push any action to TraCI yet -- that must wait until the simulation
+    clock reaches `Decision.applied_sim_time`, the sim_time the ORIGINAL
+    run's action actually took effect at (which, for mode="llm", is later
+    than `sim_time` here: the decision cycle runs as a background asyncio
+    task, and pushing to TraCI only happens once the main loop notices it
+    finished -- see sim/runner.py's module docstring). Applying at
+    decide-time instead of that later actual-apply-time measurably changes
+    the replayed trajectory (~1% off on mean_travel_time_s, observed while
+    building this). A decision from an OLDER run that predates the
+    `applied_sim_time`/`final_action_type` columns falls back to applying
+    immediately at `sim_time` with the originally-proposed `action_type`/
+    `params` -- exact whenever nothing was clamped/modified/delayed, and
+    the best information available otherwise; STEPS.md Step 17 documents
+    this as a known approximation for pre-Step-17 runs.
+
+    Returns `(had_activity, pending_applies)`: `had_activity=False` means
+    this cycle was a skipped cycle in the source run (STEPS.md Step 14's
+    `n_skipped_cycles`), which the caller should count the same way;
+    `pending_applies` are handed to `_apply_due_replay_actions` by the
+    caller, checked every simulation step (not just every control
+    interval), since `applied_sim_time` can fall anywhere in between."""
+    messages, decisions, llm_calls = replay_source.at(sim_time)
+    if not messages and not decisions and not llm_calls:
+        return False, []
+
+    for m in messages:
+        await store.add_message(
+            run_id=run_id,
+            sim_time=sim_time,
+            cycle_id=cycle_id,
+            round=m.round,
+            sender=m.sender,
+            recipients=m.recipients,
+            intent=m.intent,
+            payload=m.payload,
+            rationale=m.rationale,
+        )
+    for c in llm_calls:
+        await store.add_llm_call(
+            run_id=run_id,
+            sim_time=sim_time,
+            agent_id=c.agent_id,
+            role=c.role,
+            model=c.model,
+            effort=c.effort,
+            input_tokens=c.input_tokens,
+            output_tokens=c.output_tokens,
+            reasoning_tokens=c.reasoning_tokens,
+            cached_tokens=c.cached_tokens,
+            latency_ms=c.latency_ms,
+            status=c.status,
+            error=c.error,
+            cost_usd=c.cost_usd,
+        )
+    pending_applies: list[_PendingReplayApply] = []
+    for d in decisions:
+        decision_id = await store.add_decision(
+            run_id=run_id,
+            sim_time=sim_time,
+            cycle_id=cycle_id,
+            junction_id=d.junction_id,
+            action_type=d.action_type,
+            params=d.params,
+            validator_status=d.validator_status,
+            validator_violations=d.validator_violations,
+            supervisor_verdict=d.supervisor_verdict,
+            supervisor_reason=d.supervisor_reason,
+            applied=False,
+        )
+        if d.applied:
+            final_action_type = d.final_action_type or d.action_type
+            final_action_params = d.final_action_params if d.final_action_type is not None else d.params
+            action = _action_from_row(final_action_type, d.junction_id, final_action_params)
+            target_sim_time = d.applied_sim_time if d.applied_sim_time is not None else sim_time
+            pending_applies.append((target_sim_time, decision_id, action, d.effect))
+        elif d.effect is not None:
+            await store.update_decision(decision_id, effect=d.effect)
+    return True, pending_applies
+
+
+async def _apply_due_replay_actions(
+    conn: SumoConnection,
+    store: Store,
+    pending: list[_PendingReplayApply],
+    sim_time: float,
+) -> list[_PendingReplayApply]:
+    """Push to TraCI any replay action whose `applied_sim_time` has now
+    been reached, and return the ones still waiting. `sim_time=inf` (used
+    once the simulation ends, same as `_apply_llm_decisions`'s "last
+    cycle's task" flush) forces every remaining entry through."""
+    still_pending: list[_PendingReplayApply] = []
+    for target_sim_time, decision_id, action, effect in pending:
+        if sim_time >= target_sim_time:
+            apply_action(conn, action)  # the source run already proved this exact action applies cleanly
+            await store.update_decision(
+                decision_id,
+                applied=True,
+                final_action_type=action.type,
+                final_action_params=action.model_dump(exclude={"type", "junction_id"}),
+                applied_sim_time=target_sim_time,
+                effect=effect,
+            )
+        else:
+            still_pending.append((target_sim_time, decision_id, action, effect))
+    return still_pending
 
 
 async def _run_llm_decision_cycle(
@@ -188,13 +337,19 @@ async def _apply_llm_decisions(
     decisions: list[CycleDecision],
     decision_snapshots: dict[str, JunctionSnapshot],
     pending_effect: dict[str, tuple[int, dict]],
+    sim_time: float,
 ) -> None:
     """Apply every decision's `final_action` -- the only place mode="llm"
     ever touches TraCI (`agents/orchestrator.py` never does; plan section
     3.1's "sim_process sở hữu DUY NHẤT kết nối TraCI"). Then remember
     (decision_id, metric-at-decision-time) per junction so the NEXT cycle
     can fill in `effect` once the "after" metric exists (STEPS.md Step 14:
-    "Điền decisions.effect ở chu kỳ kế")."""
+    "Điền decisions.effect ở chu kỳ kế"). `sim_time` here is the CURRENT
+    simulation clock -- i.e. when this actually gets pushed to TraCI, which
+    for mode="llm" is later than the decision cycle's own `sim_time` (the
+    background task may take a while to finish, see the module docstring)
+    -- recorded as `applied_sim_time` so STEPS.md Step 17's `--replay` can
+    re-apply it at the same simulated moment, not the moment it was decided."""
     for d in decisions:
         if d.final_action is None:
             continue
@@ -206,22 +361,47 @@ async def _apply_llm_decisions(
             # pipeline approved this but it wasn't physically applied yet".
             await store.update_decision(d.decision_id, applied=False, effect={"note": str(exc)})
             continue
-        await store.update_decision(d.decision_id, applied=True)
+        await store.update_decision(
+            d.decision_id,
+            applied=True,
+            final_action_type=d.final_action.type,
+            final_action_params=d.final_action.model_dump(exclude={"type", "junction_id"}),
+            applied_sim_time=sim_time,
+        )
         pending_effect[d.junction_id] = (d.decision_id, _metric_dict(decision_snapshots[d.junction_id]))
 
 
-async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid.UUID:
+async def run(
+    *,
+    scenario: str | None = None,
+    mode: str | None = None,
+    seed: int | None = None,
+    gui: bool = False,
+    replay_of: uuid.UUID | None = None,
+) -> uuid.UUID:
     """Run one (scenario, mode, seed) simulation end to end and return its
     run_id -- scripts/compare.py (STEPS.md Step 9) calls this directly,
     in-process, once per (mode, seed) combination (sequentially: libsumo
-    only supports one simulation per process at a time)."""
+    only supports one simulation per process at a time).
+
+    `replay_of` (STEPS.md Step 17): replay a previous mode="llm" run's
+    recorded decisions instead of calling the LLM again ($0 API cost).
+    `scenario`/`mode`/`seed` are then read from that source run itself
+    (see `main()`'s CLI validation -- they must not be passed alongside
+    `replay_of`)."""
+    engine = make_async_engine()
+    session_factory = make_session_factory(engine)
+
+    replay_source: ReplaySource | None = None
+    if replay_of is not None:
+        replay_source = await load_replay_source(session_factory, replay_of)
+        scenario, seed, mode = replay_source.run.scenario, replay_source.run.seed, "llm"
+    assert scenario is not None and mode is not None and seed is not None
+
     is_llm_mode = mode == "llm"
     scenario_dir = NETWORKS_DIR / scenario
     sumo_cfg = scenario_dir / _SUMOCFG_BY_MODE.get(mode, _DEFAULT_SUMOCFG)
     incidents_path = scenario_dir / "incidents.yaml"
-
-    engine = make_async_engine()
-    session_factory = make_session_factory(engine)
 
     incidents = load_incident_schedule(incidents_path) if incidents_path.exists() else []
     injector = IncidentInjector(incidents)
@@ -237,6 +417,7 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
                 "control_interval_s": CONTROL_INTERVAL_S,
                 "n_incidents": len(incidents),
                 "llm_agent_junctions": LLM_AGENT_JUNCTIONS if is_llm_mode else None,
+                "replay_of": str(replay_of) if replay_of is not None else None,
             },
         )
         print(f"run_id={run_id} scenario={scenario} mode={mode} seed={seed}")
@@ -259,6 +440,10 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
         pending_task: asyncio.Task[list[CycleDecision]] | None = None
         pending_task_snapshots: dict[str, JunctionSnapshot] = {}
         pending_effect: dict[str, tuple[int, dict]] = {}
+        # STEPS.md Step 17 (--replay) only: actions waiting for the sim
+        # clock to reach their recorded `applied_sim_time` -- see
+        # `_replay_decision_cycle`/`_apply_due_replay_actions`.
+        pending_replay_applies: list[_PendingReplayApply] = []
         time_since_last_green: dict[str, dict[str, float]] = {jid: {} for jid in LLM_AGENT_JUNCTIONS}
         # Per-junction trend history for JunctionAgent.observe() (STEPS.md
         # Step 14 follow-up): a real full-hour run found the model staying
@@ -290,7 +475,7 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
         try:
             conn.start(sumo_cfg, seed=seed)
             junction_ids = traffic_light_ids(conn)
-            if is_llm_mode:
+            if is_llm_mode and replay_source is None:
                 # Same lane/link topology as net.xml (netconvert only
                 # changed tls.default-type) -- read from the actuated file
                 # for consistency with what `conn` actually has loaded.
@@ -304,6 +489,11 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
                 # MaxPressureController's own `_movements` cache) -- build
                 # once, reuse every decision cycle.
                 llm_phase_lane_groups = {jid: phase_lane_groups(conn, jid) for jid in LLM_AGENT_JUNCTIONS}
+            elif is_llm_mode:
+                # Replay mode (STEPS.md Step 17): no live agents/supervisor
+                # at all -- every decision cycle is read back from
+                # `replay_source` instead of asking a real JunctionAgent.
+                controller_observe = None
             else:
                 controller = make_controller(mode, conn)
                 # Optional per-controller hook, not part of the shared Controller
@@ -349,13 +539,14 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
                         )
                     last_sample_time = sim_time
 
-                    if is_llm_mode:
+                    if is_llm_mode and replay_source is None:
                         # Starvation history for validator.py's anti-hogging
                         # check (safety/validator.py's TlsState docstring --
                         # "a missing key is treated as recently green", which
                         # is fine for baselines but not for an unattended
                         # hour-long agent run). Cheap: pure TraCI reads, no
-                        # LLM/network involved.
+                        # LLM/network involved. Not needed in replay mode --
+                        # nothing calls validate()/observe() again there.
                         for jid in LLM_AGENT_JUNCTIONS:
                             current_phase = str(snapshots[jid].current_phase)
                             tracked = time_since_last_green[jid]
@@ -371,7 +562,14 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
                         controller_observe(snapshots, sim_time)
 
                     if sim_time - last_control_time >= CONTROL_INTERVAL_S:
-                        if is_llm_mode:
+                        if replay_source is not None:
+                            had_activity, new_pending = await _replay_decision_cycle(
+                                conn, store, run_id, cycle_id, sim_time, replay_source
+                            )
+                            if not had_activity:
+                                n_skipped_cycles += 1
+                            pending_replay_applies.extend(new_pending)
+                        elif is_llm_mode:
                             # Resolve `effect` for the PREVIOUS cycle's applied
                             # decisions using this cycle's fresh snapshots
                             # (STEPS.md Step 14: "Điền effect ở chu kỳ kế").
@@ -450,10 +648,17 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
 
                 if is_llm_mode and pending_task is not None and pending_task.done():
                     decisions = pending_task.result()
-                    await _apply_llm_decisions(conn, store, decisions, pending_task_snapshots, pending_effect)
+                    await _apply_llm_decisions(conn, store, decisions, pending_task_snapshots, pending_effect, sim_time)
                     pending_task = None
 
-                if is_llm_mode:
+                if replay_source is not None and pending_replay_applies:
+                    # Checked every step, not just every control interval --
+                    # `applied_sim_time` can fall anywhere in between.
+                    pending_replay_applies = await _apply_due_replay_actions(
+                        conn, store, pending_replay_applies, sim_time
+                    )
+
+                if is_llm_mode and replay_source is None:
                     # Pace to LLM_REALTIME_SPEEDUP (see the comment above the
                     # loop) instead of a bare yield -- gives pending decision
                     # tasks real wall-clock time to actually finish.
@@ -461,6 +666,10 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
                     actual_elapsed = time.monotonic() - wall_clock_start
                     await asyncio.sleep(max(0.0, target_elapsed - actual_elapsed))
                 else:
+                    # Baseline speed for baselines AND replay (STEPS.md Step
+                    # 17) -- replay never awaits any real async work (no
+                    # OpenAI calls), so there is nothing to pace for; running
+                    # it at full libsumo speed is the whole point ($0, fast).
                     await asyncio.sleep(0)  # yield the event loop (plan section 3.2)
 
             # The last cycle's task may still be running when demand ends --
@@ -468,7 +677,18 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
             # (conn is still open here, needed to actually apply them).
             if is_llm_mode and pending_task is not None:
                 decisions = await pending_task
-                await _apply_llm_decisions(conn, store, decisions, pending_task_snapshots, pending_effect)
+                await _apply_llm_decisions(conn, store, decisions, pending_task_snapshots, pending_effect, sim_time)
+
+            if replay_source is not None and pending_replay_applies:
+                # Same reasoning as the "last cycle's task" flush above --
+                # the source run's last decision cycle's `applied_sim_time`
+                # is guaranteed to be <= its own final_sim_time (the
+                # original run always eventually applied it too), so
+                # sim_time=inf forces every remaining entry through rather
+                # than risking dropping it because of a float boundary.
+                pending_replay_applies = await _apply_due_replay_actions(
+                    conn, store, pending_replay_applies, float("inf")
+                )
 
             final_sim_time = conn.simulation.getTime()
         finally:
@@ -496,17 +716,26 @@ async def run(*, scenario: str, mode: str, seed: int, gui: bool = False) -> uuid
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", required=True, help="e.g. grid_4x4 (a folder under networks/)")
-    parser.add_argument(
-        "--mode",
-        required=True,
-        help="fixed | actuated | maxpressure | llm",
-    )
-    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--scenario", help="e.g. grid_4x4 (a folder under networks/) -- omit with --replay")
+    parser.add_argument("--mode", help="fixed | actuated | maxpressure | llm -- omit with --replay (always 'llm')")
+    parser.add_argument("--seed", type=int, help="omit with --replay")
     parser.add_argument("--gui", action="store_true", help="watch it live via sumo-gui instead of running headless")
+    parser.add_argument(
+        "--replay",
+        metavar="RUN_ID",
+        help="STEPS.md Step 17: replay a previous mode=llm run's recorded decisions instead of "
+        "calling the LLM again ($0 API cost). scenario/mode/seed are read from that run.",
+    )
     args = parser.parse_args()
 
-    asyncio.run(run(scenario=args.scenario, mode=args.mode, seed=args.seed, gui=args.gui))
+    if args.replay is not None:
+        if args.scenario or args.mode or args.seed is not None:
+            parser.error("--replay cannot be combined with --scenario/--mode/--seed (read from the source run)")
+        asyncio.run(run(replay_of=uuid.UUID(args.replay), gui=args.gui))
+    else:
+        if not (args.scenario and args.mode and args.seed is not None):
+            parser.error("--scenario, --mode, and --seed are required unless --replay is given")
+        asyncio.run(run(scenario=args.scenario, mode=args.mode, seed=args.seed, gui=args.gui))
 
 
 if __name__ == "__main__":
